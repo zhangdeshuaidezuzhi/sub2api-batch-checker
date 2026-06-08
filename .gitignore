@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Tool outputs and sensitive account bundles
+outputs/
+*.csv
+*_good*.json
+*_bad*.json
+*可用账号*.json
+*坏账号*.json
+token_*.json
+tokens/
+sub_json/
+
+# Local configuration
+.env
+.env.*
+*.local
+local_config.ps1
+local_config.cmd
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
