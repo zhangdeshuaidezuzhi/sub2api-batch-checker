@@ -205,3 +205,50 @@ def test_maintenance_auth_evidence_soft_deletes() -> None:
     assert decision.action == "soft_delete"
     assert decision.reason == "maintenance_auth_invalid_probe"
     assert decision.evidence_count == 1
+
+
+def test_load_accounts_scopes_maintenance_to_oauth(monkeypatch) -> None:
+    sql_calls = []
+
+    def fake_run_sql(sql):
+        sql_calls.append(sql)
+        if "to_regclass" in sql:
+            return ""
+        return "id,name,status,schedulable,rate_limit_reset_at,temp_unschedulable_until,temp_pause_active,temp_unschedulable_reason,last_probe_at,last_probe_result,updated_at\n"
+
+    monkeypatch.setattr(cloud, "run_sql", fake_run_sql)
+
+    assert cloud.load_accounts() == {}
+    assert "a.type = 'oauth'" in sql_calls[-1]
+
+
+def test_error_and_long_pause_evidence_ignore_apikey(monkeypatch) -> None:
+    sql_calls = []
+
+    def fake_run_sql(sql):
+        sql_calls.append(sql)
+        return "account_id,status_code,error_type,provider_error_code,message,n,last_seen_at\n"
+
+    monkeypatch.setattr(cloud, "run_sql", fake_run_sql)
+
+    assert cloud.load_error_status_evidence() == {}
+    assert "type = 'oauth'" in sql_calls[-1]
+
+    assert cloud.load_long_paused_rate_limit_evidence(7) == {}
+    assert "type = 'oauth'" in sql_calls[-1]
+
+
+def test_shorten_long_temporary_pauses_only_updates_oauth(monkeypatch) -> None:
+    sql_calls = []
+
+    def fake_run_sql(sql):
+        sql_calls.append(sql)
+        return "0"
+
+    monkeypatch.setattr(cloud, "run_sql", fake_run_sql)
+
+    assert cloud.shorten_long_temporary_pauses(False, 10) == 0
+    assert "type = 'oauth'" in sql_calls[-1]
+
+    assert cloud.shorten_long_temporary_pauses(True, 10) == 0
+    assert "type = 'oauth'" in sql_calls[-1]

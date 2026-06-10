@@ -661,6 +661,9 @@ def merge_evidence(*sources):
 
 
 def load_accounts():
+    # Cloud maintenance only owns OAuth/token-json accounts. API-key upstreams are
+    # managed by the separate key workflow to avoid deleting good keys on transient
+    # upstream/network failures.
     state_table_exists = run_sql("SELECT to_regclass('public.ops_account_active_probe_state');").strip()
     if state_table_exists:
         state_join = "LEFT JOIN ops_account_active_probe_state s ON s.account_id = a.id"
@@ -689,6 +692,7 @@ COPY (
   FROM accounts a
   {state_join}
   WHERE a.deleted_at IS NULL
+    AND a.type = 'oauth'
 ) TO STDOUT WITH CSV HEADER;
 """.format(state_columns=state_columns, state_join=state_join)
     out = run_sql(sql)
@@ -710,6 +714,7 @@ COPY (
          updated_at AS last_seen_at
   FROM accounts
   WHERE deleted_at IS NULL
+    AND type = 'oauth'
     AND status = 'error'
     AND coalesce(error_message, '') <> ''
 ) TO STDOUT WITH CSV HEADER;
@@ -744,6 +749,7 @@ COPY (
          updated_at AS last_seen_at
   FROM accounts
   WHERE deleted_at IS NULL
+    AND type = 'oauth'
     AND status = 'active'
     AND schedulable = false
     AND rate_limit_reset_at IS NOT NULL
@@ -906,6 +912,7 @@ def shorten_long_temporary_pauses(apply, temporary_rate_pause_minutes):
 SELECT count(*)
 FROM accounts
 WHERE deleted_at IS NULL
+  AND type = 'oauth'
   AND status = 'active'
   AND schedulable = false
   AND temp_unschedulable_until IS NOT NULL
@@ -925,6 +932,7 @@ WITH shortened AS (
       temp_unschedulable_until = ({reset_sql}),
       updated_at = now()
   WHERE deleted_at IS NULL
+    AND type = 'oauth'
     AND status = 'active'
     AND schedulable = false
     AND temp_unschedulable_until IS NOT NULL

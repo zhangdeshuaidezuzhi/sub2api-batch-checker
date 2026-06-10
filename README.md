@@ -107,6 +107,8 @@ Windows 也可以把 good 包拖到：
 
 用户给 `base_url + API key` 时，走单独流程：先测 `/v1/models`，再选一个模型测 `/v1/chat/completions`。两步都通过才生成 good 包并导入云端；任一步失败直接废弃，不导入。
 
+API key 上游账号不由云端号池维护脚本自动暂停、恢复探针或清理，避免网络波动和上游临时异常误伤可用 key；key 方式只走这条单独检测/导入流程。
+
 输入 JSON 形状：
 
 ```json
