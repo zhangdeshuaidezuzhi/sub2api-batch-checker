@@ -12,6 +12,7 @@ CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_USER_AGENT = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
 CODEX_ORIGINATOR = "codex-tui"
 DEFAULT_TEMPORARY_USAGE_LIMIT_MAX_SECONDS = 12 * 60 * 60
+DEFAULT_RECOVER_DELETE_AFTER_FAILURES = 3
 
 AUTH_INVALID_PATTERNS = [
     "invalidated oauth token",
@@ -101,6 +102,13 @@ TEMPORARY_LIMIT_SIGNALS = (
     "temporary_rate_limit",
     "temporary_usage_limit",
     "usage_limit_unknown_reset",
+    "usage_or_weekly_limit",
+)
+ACTIVE_PROBE_COUNTED_FAILURES = (
+    "auth_invalid_probe_only",
+    "probe_skipped_missing_access_token",
+    "probe_failed_unknown",
+    "probe_network_or_proxy",
 )
 
 
@@ -294,7 +302,7 @@ CREATE TABLE IF NOT EXISTS ops_account_maintenance_audits (
 
 
 def ensure_probe_state_table(apply):
-    sql = """
+    create_sql = """
 CREATE TABLE IF NOT EXISTS ops_account_active_probe_state (
   account_id BIGINT PRIMARY KEY,
   last_probe_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -302,11 +310,18 @@ CREATE TABLE IF NOT EXISTS ops_account_active_probe_state (
   last_http_status INTEGER,
   last_error_code TEXT,
   last_message TEXT,
+  recovery_probe_failures INTEGER NOT NULL DEFAULT 0,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
     if apply:
-        run_sql(sql)
+        run_sql(create_sql)
+        run_sql(
+            """
+ALTER TABLE IF EXISTS ops_account_active_probe_state
+  ADD COLUMN IF NOT EXISTS recovery_probe_failures INTEGER NOT NULL DEFAULT 0;
+"""
+        )
 
 
 def load_error_evidence(lookback_hours):
@@ -592,6 +607,49 @@ COPY (
     return evidence
 
 
+def load_cloud_maintenance_auth_evidence(lookback_hours):
+    audit_table_exists = run_sql("SELECT to_regclass('public.ops_account_maintenance_audits');").strip()
+    if not audit_table_exists:
+        return {}
+    text_expr = "coalesce(reason, '') || ' ' || coalesce(sample_message, '')"
+    sql = f"""
+COPY (
+  SELECT account_id,
+         '401' AS status_code,
+         action AS error_type,
+         reason AS provider_error_code,
+         left(coalesce(sample_message, '') || ' ' || coalesce(reason, ''), 1000) AS message,
+         evidence_count AS n,
+         created_at AS last_seen_at
+  FROM ops_account_maintenance_audits
+  WHERE created_at >= now() - interval '{int(lookback_hours)} hours'
+    AND applied = true
+    AND action = 'pause_auth_invalid'
+    AND (
+      lower({text_expr}) LIKE '%invalid%'
+      OR lower({text_expr}) LIKE '%token_invalidated%'
+      OR lower({text_expr}) LIKE '%missing_access_token%'
+      OR lower({text_expr}) LIKE '%authentication token has been invalidated%'
+      OR coalesce(sample_message, '') LIKE '%无效%'
+    )
+    AND account_id IS NOT NULL
+) TO STDOUT WITH CSV HEADER;
+"""
+    out = run_sql(sql)
+    lines = out.splitlines()
+    if len(lines) <= 1:
+        return {}
+    import csv
+    from io import StringIO
+
+    evidence = {}
+    for row in csv.DictReader(StringIO(out)):
+        row["source"] = "ops_account_maintenance_auth_audits"
+        account_id = int(row["account_id"])
+        evidence.setdefault(account_id, []).append(row)
+    return evidence
+
+
 def merge_evidence(*sources):
     merged = {}
     for source in sources:
@@ -714,14 +772,22 @@ def load_active_probe_candidates(limit, min_interval_hours):
     state_table_exists = run_sql("SELECT to_regclass('public.ops_account_active_probe_state');").strip()
     if state_table_exists:
         state_join = "LEFT JOIN ops_account_active_probe_state s ON s.account_id = a.id"
-        state_column = "coalesce(s.last_probe_at::text, '') AS last_probe_at"
+        state_column = """
+         coalesce(s.last_probe_at::text, '') AS last_probe_at,
+         coalesce(s.recovery_probe_failures::text, '0') AS recovery_probe_failures,
+         coalesce(s.last_result, '') AS previous_probe_result
+"""
         state_filter = "AND (s.last_probe_at IS NULL OR s.last_probe_at < now() - interval '{0} hours')".format(
             int(min_interval_hours)
         )
         state_order = "s.last_probe_at ASC NULLS FIRST,"
     else:
         state_join = ""
-        state_column = "'' AS last_probe_at"
+        state_column = """
+         '' AS last_probe_at,
+         '0' AS recovery_probe_failures,
+         '' AS previous_probe_result
+"""
         state_filter = ""
         state_order = ""
     sql = f"""
@@ -762,6 +828,37 @@ def load_expired_temporary_pause_candidates(limit):
     if int(limit) <= 0:
         return []
     text_expr = "coalesce(a.temp_unschedulable_reason, '') || ' ' || coalesce(a.error_message, '')"
+    state_table_exists = run_sql("SELECT to_regclass('public.ops_account_active_probe_state');").strip()
+    audit_table_exists = run_sql("SELECT to_regclass('public.ops_account_maintenance_audits');").strip()
+    if state_table_exists:
+        state_join = "LEFT JOIN ops_account_active_probe_state s ON s.account_id = a.id"
+        state_column = "coalesce(s.recovery_probe_failures::text, '0') AS recovery_probe_failures,"
+    else:
+        state_join = ""
+        state_column = "'0' AS recovery_probe_failures,"
+    if audit_table_exists:
+        historical_column = """
+         coalesce((
+           SELECT count(*)::text
+           FROM ops_account_maintenance_audits aud
+           WHERE aud.account_id = a.id
+             AND aud.applied = true
+             AND aud.action IN ('pause_usage_limited', 'pause_auth_invalid')
+             AND (
+               aud.reason LIKE '%still_limited'
+               OR aud.reason = 'temporary_rate_limit_probe_inconclusive'
+               OR aud.reason = 'expired_pause_auth_invalid_probe_only'
+             )
+             AND aud.created_at > coalesce((
+               SELECT max(ok_aud.created_at)
+               FROM ops_account_maintenance_audits ok_aud
+               WHERE ok_aud.account_id = a.id
+                 AND ok_aud.action = 'recover_temporary_rate_limit'
+             ), 'epoch'::timestamptz)
+         ), '0') AS historical_recovery_probe_failures
+"""
+    else:
+        historical_column = "'0' AS historical_recovery_probe_failures"
     sql = f"""
 COPY (
   SELECT a.id,
@@ -776,9 +873,12 @@ COPY (
          coalesce(p.username, '') AS proxy_username,
          coalesce(p.password, '') AS proxy_password,
          coalesce(a.temp_unschedulable_until::text, '') AS temp_unschedulable_until,
-         coalesce(a.temp_unschedulable_reason, '') AS temp_unschedulable_reason
+         coalesce(a.temp_unschedulable_reason, '') AS temp_unschedulable_reason,
+         {state_column}
+         {historical_column}
   FROM accounts a
   LEFT JOIN proxies p ON p.id = a.proxy_id AND p.deleted_at IS NULL AND p.status = 'active'
+  {state_join}
   WHERE a.deleted_at IS NULL
     AND a.status = 'active'
     AND a.schedulable = false
@@ -1037,21 +1137,27 @@ def active_probe_account(row, model, timeout, temporary_usage_limit_max_seconds=
         }
 
 
-def record_probe_state(result, apply):
+def record_probe_state(result, apply, recovery_failure_count=None):
     if not apply:
         return
     status_value = "NULL" if result.get("http_status") is None else str(int(result.get("http_status")))
+    recovery_value = "0" if recovery_failure_count is None else str(max(0, int(recovery_failure_count)))
+    recovery_update = "false" if recovery_failure_count is None else "true"
     sql = f"""
 INSERT INTO ops_account_active_probe_state
-  (account_id, last_probe_at, last_result, last_http_status, last_error_code, last_message, updated_at)
+  (account_id, last_probe_at, last_result, last_http_status, last_error_code, last_message, recovery_probe_failures, updated_at)
 VALUES
-  ({int(result["account_id"])}, now(), {sql_string(result.get("result", ""))}, {status_value}, {sql_string(result.get("error_code", ""))}, {sql_string(result.get("message", ""))}, now())
+  ({int(result["account_id"])}, now(), {sql_string(result.get("result", ""))}, {status_value}, {sql_string(result.get("error_code", ""))}, {sql_string(result.get("message", ""))}, {recovery_value}, now())
 ON CONFLICT (account_id) DO UPDATE SET
   last_probe_at = excluded.last_probe_at,
   last_result = excluded.last_result,
   last_http_status = excluded.last_http_status,
   last_error_code = excluded.last_error_code,
   last_message = excluded.last_message,
+  recovery_probe_failures = CASE
+    WHEN {recovery_update} THEN excluded.recovery_probe_failures
+    ELSE ops_account_active_probe_state.recovery_probe_failures
+  END,
   updated_at = now();
 """
     run_sql(sql)
@@ -1059,6 +1165,31 @@ ON CONFLICT (account_id) DO UPDATE SET
 
 def is_temporary_limit_result(result_name):
     return result_name in TEMPORARY_LIMIT_SIGNALS
+
+
+def recovery_failure_count_before(row):
+    counts = []
+    for key in ("recovery_probe_failures", "historical_recovery_probe_failures"):
+        try:
+            counts.append(int(row.get(key) or 0))
+        except Exception:
+            counts.append(0)
+    return max(counts or [0])
+
+
+def should_delete_after_recovery_failure(failure_count, threshold):
+    return int(threshold) > 0 and int(failure_count) >= int(threshold)
+
+
+def active_probe_failure_count_before(row):
+    try:
+        return max(0, int(row.get("recovery_probe_failures") or 0))
+    except Exception:
+        return 0
+
+
+def is_counted_active_probe_failure(result_name):
+    return is_temporary_limit_result(result_name) or result_name in ACTIVE_PROBE_COUNTED_FAILURES
 
 
 def run_active_probes(args, now_iso):
@@ -1070,37 +1201,36 @@ def run_active_probes(args, now_iso):
     decisions = []
     results = []
     for row in candidates:
+        previous_failures = active_probe_failure_count_before(row)
         result = active_probe_account(
             row,
             args.probe_model,
             args.probe_timeout,
             args.temporary_usage_limit_max_seconds,
         )
-        record_probe_state(result, True)
         results.append(result)
+
+        if result["result"] == "ok":
+            record_probe_state(result, True, 0)
+            continue
+        if result["result"] == "ignored_transient":
+            record_probe_state(result, True)
+            continue
+
+        probe_failures = previous_failures + 1 if is_counted_active_probe_failure(result["result"]) else previous_failures
+        if result["result"] in ("usage_quota_exhausted", "banned_or_forbidden"):
+            probe_failures = previous_failures + 1
+        record_probe_state(result, True, probe_failures)
+
         if result["result"] == "usage_quota_exhausted":
             decisions.append(
                 Decision(
                     result["account_id"],
                     "soft_delete",
                     "active_probe_usage_quota_exhausted",
-                    1,
+                    max(1, probe_failures),
                     now_iso,
                     result.get("message", ""),
-                )
-            )
-        elif is_temporary_limit_result(result["result"]):
-            reset_sql, reset_source = parse_reset_hint(result.get("message", ""))
-            decisions.append(
-                Decision(
-                    result["account_id"],
-                    "pause_usage_limited",
-                    "active_probe_" + result["result"],
-                    1,
-                    now_iso,
-                    result.get("message", ""),
-                    reset_sql,
-                    reset_source,
                 )
             )
         elif result["result"] == "banned_or_forbidden":
@@ -1109,11 +1239,60 @@ def run_active_probes(args, now_iso):
                     result["account_id"],
                     "soft_delete",
                     "active_probe_banned_or_forbidden",
-                    1,
+                    max(1, probe_failures),
                     now_iso,
                     result.get("message", ""),
                 )
             )
+        elif is_temporary_limit_result(result["result"]):
+            if should_delete_after_recovery_failure(probe_failures, args.recover_delete_after_failures):
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "soft_delete",
+                        "active_probe_failed_{0}_times".format(probe_failures),
+                        probe_failures,
+                        now_iso,
+                        result.get("message", ""),
+                    )
+                )
+            else:
+                reset_sql, reset_source = parse_reset_hint(result.get("message", ""))
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "pause_usage_limited",
+                        "active_probe_" + result["result"],
+                        probe_failures,
+                        now_iso,
+                        result.get("message", ""),
+                        reset_sql,
+                        reset_source,
+                    )
+                )
+        elif result["result"] in ("auth_invalid_probe_only", "probe_skipped_missing_access_token"):
+            decisions.append(
+                Decision(
+                    result["account_id"],
+                    "soft_delete",
+                    "active_probe_auth_invalid_probe_only",
+                    max(1, probe_failures),
+                    now_iso,
+                    result.get("message", ""),
+                )
+            )
+        elif result["result"] in ("probe_failed_unknown", "probe_network_or_proxy"):
+            if should_delete_after_recovery_failure(probe_failures, args.recover_delete_after_failures):
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "soft_delete",
+                        "active_probe_failed_{0}_times".format(probe_failures),
+                        probe_failures,
+                        now_iso,
+                        result.get("message", ""),
+                    )
+                )
     return decisions, results, len(candidates)
 
 
@@ -1153,6 +1332,7 @@ def classify(account_id, rows, now_iso, min_hard_failures, temporary_usage_limit
     total_temporary_rate = 0
     total_long_rate_pause = 0
     total_error_status_auth = 0
+    total_maintenance_auth = 0
     newest = rows[0]
     sample = newest.get("message", "")
     auth_sample = ""
@@ -1194,6 +1374,8 @@ def classify(account_id, rows, now_iso, min_hard_failures, temporary_usage_limit
                 auth_last_seen_at = row.get("last_seen_at", "")
             if row.get("source") == "accounts_error_status":
                 total_error_status_auth += count
+            if row.get("source") == "ops_account_maintenance_auth_audits":
+                total_maintenance_auth += count
         else:
             limit_signal = classify_limit_signal(message, row.get("status_code"), temporary_usage_limit_max_seconds)
             if limit_signal == "usage_quota_exhausted":
@@ -1243,6 +1425,8 @@ def classify(account_id, rows, now_iso, min_hard_failures, temporary_usage_limit
         return None
     if total_error_status_auth >= 1:
         return Decision(account_id, "soft_delete", "error_status_auth_invalid", total_error_status_auth, auth_last_seen_at or last_seen_at, auth_sample or sample)
+    if total_maintenance_auth >= 1:
+        return Decision(account_id, "soft_delete", "maintenance_auth_invalid_probe", total_maintenance_auth, auth_last_seen_at or last_seen_at, auth_sample or sample)
     if total_auth >= min_hard_failures:
         return Decision(account_id, "soft_delete", "repeated_auth_invalid", total_auth, auth_last_seen_at or last_seen_at, auth_sample or sample)
     if total_auth > 0:
@@ -1367,18 +1551,24 @@ def run_expired_pause_recovery(args, now_iso):
     results = []
     recovered_count = 0
     for row in candidates:
+        previous_recovery_failures = recovery_failure_count_before(row)
         result = active_probe_account(
             row,
             args.probe_model,
             args.probe_timeout,
             args.temporary_usage_limit_max_seconds,
         )
-        record_probe_state(result, True)
         results.append(result)
         if result["result"] == "ok":
+            record_probe_state(result, True, 0)
             apply_recovery(result, now_iso)
             recovered_count += 1
-        elif result["result"] == "usage_quota_exhausted":
+            continue
+
+        recovery_failures = previous_recovery_failures + 1
+        record_probe_state(result, True, recovery_failures)
+
+        if result["result"] == "usage_quota_exhausted":
             decisions.append(
                 Decision(
                     result["account_id"],
@@ -1390,19 +1580,31 @@ def run_expired_pause_recovery(args, now_iso):
                 )
             )
         elif is_temporary_limit_result(result["result"]):
-            reset_sql, reset_source = parse_reset_hint(result.get("message", ""))
-            decisions.append(
-                Decision(
-                    result["account_id"],
-                    "pause_usage_limited",
-                    result["result"] + "_still_limited",
-                    1,
-                    now_iso,
-                    result.get("message", ""),
-                    reset_sql,
-                    reset_source,
+            if should_delete_after_recovery_failure(recovery_failures, args.recover_delete_after_failures):
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "soft_delete",
+                        "expired_pause_recovery_failed_{0}_times".format(recovery_failures),
+                        recovery_failures,
+                        now_iso,
+                        result.get("message", ""),
+                    )
                 )
-            )
+            else:
+                reset_sql, reset_source = parse_reset_hint(result.get("message", ""))
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "pause_usage_limited",
+                        result["result"] + "_still_limited",
+                        recovery_failures,
+                        now_iso,
+                        result.get("message", ""),
+                        reset_sql,
+                        reset_source,
+                    )
+                )
         elif result["result"] == "banned_or_forbidden":
             decisions.append(
                 Decision(
@@ -1415,27 +1617,51 @@ def run_expired_pause_recovery(args, now_iso):
                 )
             )
         elif result["result"] in ("auth_invalid_probe_only", "probe_skipped_missing_access_token"):
-            decisions.append(
-                Decision(
-                    result["account_id"],
-                    "pause_auth_invalid",
-                    "expired_pause_auth_invalid_probe_only",
-                    1,
-                    now_iso,
-                    result.get("message", ""),
+            if should_delete_after_recovery_failure(recovery_failures, args.recover_delete_after_failures):
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "soft_delete",
+                        "expired_pause_recovery_failed_{0}_times".format(recovery_failures),
+                        recovery_failures,
+                        now_iso,
+                        result.get("message", ""),
+                    )
                 )
-            )
+            else:
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "pause_auth_invalid",
+                        "expired_pause_auth_invalid_probe_only",
+                        recovery_failures,
+                        now_iso,
+                        result.get("message", ""),
+                    )
+                )
         else:
-            decisions.append(
-                Decision(
-                    result["account_id"],
-                    "pause_usage_limited",
-                    "temporary_rate_limit_probe_inconclusive",
-                    1,
-                    now_iso,
-                    result.get("message", ""),
+            if should_delete_after_recovery_failure(recovery_failures, args.recover_delete_after_failures):
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "soft_delete",
+                        "expired_pause_recovery_failed_{0}_times".format(recovery_failures),
+                        recovery_failures,
+                        now_iso,
+                        result.get("message", ""),
+                    )
                 )
-            )
+            else:
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "pause_usage_limited",
+                        "temporary_rate_limit_probe_inconclusive",
+                        recovery_failures,
+                        now_iso,
+                        result.get("message", ""),
+                    )
+                )
     return decisions, results, len(candidates), recovered_count
 
 
@@ -1451,6 +1677,7 @@ def main():
     parser.add_argument("--probe-active", action="store_true", help="Actively probe a rotating sample of schedulable OAuth accounts.")
     parser.add_argument("--probe-limit", type=int, default=0, help="Maximum active probes this run. 0 disables active probing.")
     parser.add_argument("--recover-probe-limit", type=int, default=10, help="Maximum expired temporary 429 pauses to probe this run.")
+    parser.add_argument("--recover-delete-after-failures", type=int, default=DEFAULT_RECOVER_DELETE_AFTER_FAILURES, help="Soft-delete an expired temporary pause after this many consecutive recovery probe failures. 0 disables.")
     parser.add_argument("--probe-min-interval-hours", type=int, default=24)
     parser.add_argument("--probe-timeout", type=float, default=20.0)
     parser.add_argument("--probe-model", default="gpt-5.5")
@@ -1481,6 +1708,7 @@ def main():
         load_system_log_limit_evidence(args.lookback_hours),
         load_error_status_evidence(),
         load_cloud_maintenance_usage_evidence(args.lookback_hours),
+        load_cloud_maintenance_auth_evidence(args.lookback_hours),
         load_long_paused_rate_limit_evidence(args.long_pause_delete_days),
     )
     decisions = []
@@ -1524,6 +1752,7 @@ def main():
         "active_probe_result_count": len(active_probe_results),
         "expired_pause_recovery_candidate_count": recovery_candidate_count,
         "expired_pause_recovery_result_count": len(recovery_results),
+        "recover_delete_after_failures": args.recover_delete_after_failures,
         "shortened_temporary_pause_count": shortened_temporary_pause_count,
         "decision_count": len(decisions),
         "recovered_count": recovered_count,

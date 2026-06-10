@@ -11,9 +11,10 @@ exec flock -n /tmp/sub2api-cloud-maintenance.lock \
     --usage-pause-days 7 \
     --temporary-rate-pause-minutes 20 \
     --probe-active \
-    --probe-limit 2 \
-    --recover-probe-limit 3 \
-    --probe-min-interval-hours 24 \
+    --probe-limit 50 \
+    --recover-probe-limit 20 \
+    --recover-delete-after-failures 3 \
+    --probe-min-interval-hours 1 \
     --probe-timeout 20 \
     --probe-model gpt-5.5 \
     --apply
