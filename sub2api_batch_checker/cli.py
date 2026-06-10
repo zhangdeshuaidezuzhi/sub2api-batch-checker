@@ -3,10 +3,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import os
 from collections import Counter
 from pathlib import Path
 
-from .checker import check_many
+from .checker import (
+    CLAUDE_DEFAULT_MODEL,
+    CLAUDE_MESSAGES_URL,
+    CHATGPT_CODEX_RESPONSES_URL,
+    CHATGPT_ME_URL,
+    OPENAI_USERINFO_URL,
+    SUB2API_OAUTH_COMPAT_URL,
+    check_many,
+)
 from .loader import load_sub2api_accounts, write_sub2api_bundle
 
 
@@ -18,6 +27,7 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         "name",
         "platform",
         "type",
+        "source_format",
         "account_id",
         "http_status",
         "latency_ms",
@@ -26,6 +36,7 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         "model",
         "endpoint",
         "attempts",
+        "raw_meta",
         "source_file",
         "fingerprint",
     ]
@@ -47,11 +58,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sub2API JSON file(s) or directories containing JSON files.",
     )
     parser.add_argument(
-        "--endpoint",
-        default="https://api.openai.com/v1/responses",
-        help="Probe endpoint. Use /v1/responses for real inference or /v1/models for lighter auth check.",
+        "--mode",
+        choices=["api-login", "api-real", "oidc-login", "codex-login", "codex-real", "sub2api-oauth", "claude-oauth"],
+        default="sub2api-oauth",
+        help=(
+            "Preset probe mode. api-login uses /v1/models, api-real uses /v1/responses, "
+            "oidc-login uses the official OpenAI OIDC userinfo endpoint, codex-login uses ChatGPT login diagnostics, "
+            "codex-real uses the Codex backend and may consume quota, sub2api-oauth checks Sub2API OAuth compatibility, "
+            "claude-oauth refreshes/probes Claude OAuth accounts."
+        ),
     )
-    parser.add_argument("--model", default="gpt-4.1-nano", help="Probe model for /v1/responses.")
+    parser.add_argument(
+        "--endpoint",
+        default="",
+        help="Probe endpoint. Default /v1/models checks whether auth is alive. Use /v1/responses for real inference.",
+    )
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Probe model. Defaults to gpt-5.5 for codex-real and gpt-4.1-nano otherwise.",
+    )
     parser.add_argument("--concurrency", type=int, default=10, help="Concurrent checks.")
     parser.add_argument("--timeout", type=float, default=30.0, help="Per-account HTTP timeout seconds.")
     parser.add_argument(
@@ -61,17 +87,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat tokens expiring within this many seconds as expired before network probing.",
     )
     parser.add_argument(
-        "--no-refresh",
+        "--refresh",
         action="store_true",
-        help="Do not refresh OAuth access tokens before probing.",
+        help="Refresh OAuth access tokens when needed. Slower and may be unsafe for reused CPA/Codex refresh tokens.",
     )
     parser.add_argument("--limit", type=int, default=0, help="Only check the first N loaded accounts.")
     parser.add_argument("--no-dedupe", action="store_true", help="Do not deduplicate accounts.")
     parser.add_argument("--quiet", action="store_true", help="Hide per-account progress logs.")
     parser.add_argument(
         "--proxy",
-        default="",
+        default=os.environ.get("SUB2API_CHECKER_PROXY", "http://127.0.0.1:7897"),
         help="Optional HTTP proxy URL, for example http://127.0.0.1:7890.",
+    )
+    parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Disable the default proxy.",
     )
     parser.add_argument(
         "--csv",
@@ -96,6 +127,31 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.endpoint:
+        endpoint = args.endpoint
+    elif args.mode == "api-real":
+        endpoint = "https://api.openai.com/v1/responses"
+    elif args.mode == "oidc-login":
+        endpoint = OPENAI_USERINFO_URL
+    elif args.mode == "codex-login":
+        endpoint = CHATGPT_ME_URL
+    elif args.mode == "codex-real":
+        endpoint = CHATGPT_CODEX_RESPONSES_URL
+    elif args.mode == "claude-oauth":
+        endpoint = CLAUDE_MESSAGES_URL
+    elif args.mode == "sub2api-oauth":
+        endpoint = SUB2API_OAUTH_COMPAT_URL
+    else:
+        endpoint = "https://api.openai.com/v1/models"
+    if not args.model:
+        if args.mode == "codex-real":
+            args.model = "gpt-5.5"
+        elif args.mode == "claude-oauth":
+            args.model = CLAUDE_DEFAULT_MODEL
+        elif args.mode == "api-real":
+            args.model = "gpt-4.1-nano"
+        else:
+            args.model = "gpt-4.1-nano"
 
     accounts, errors = load_sub2api_accounts(args.inputs, dedupe=not args.no_dedupe)
     if args.limit and len(accounts) > args.limit:
@@ -112,11 +168,11 @@ def main(argv: list[str] | None = None) -> int:
             accounts=accounts,
             concurrency=max(1, args.concurrency),
             timeout=args.timeout,
-            endpoint=args.endpoint,
+            endpoint=endpoint,
             model=args.model,
             local_expiry_guard_sec=args.local_expiry_guard_sec,
-            refresh=not args.no_refresh,
-            proxy_url=args.proxy,
+            refresh=args.refresh,
+            proxy_url="" if args.no_proxy else args.proxy,
             progress=not args.quiet,
         )
     )

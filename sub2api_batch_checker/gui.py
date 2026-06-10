@@ -12,17 +12,23 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from .checker import check_many
+from .checker import CHATGPT_CODEX_RESPONSES_URL, CHATGPT_ME_URL, SUB2API_OAUTH_COMPAT_URL, check_many
 from .loader import load_sub2api_accounts, write_sub2api_bundle
 
 
 TOOL_DIR = Path(os.environ.get("SUB2API_CHECKER_HOME", Path(__file__).resolve().parent.parent))
 OUTPUT_DIR = TOOL_DIR / "outputs"
 DEFAULT_INPUT = Path(os.environ.get("SUB2API_CHECKER_DEFAULT_INPUT", Path.cwd()))
+DEFAULT_PROXY = os.environ.get("SUB2API_CHECKER_PROXY", "http://127.0.0.1:7897")
 
 STATUS_CN = {
     "ok": "可用",
+    "codex_login_only": "Codex登录有效/API权限不足",
+    "sub2api_compatible": "Sub2API兼容可用",
+    "model_unsupported": "模型不支持/请求方式待适配",
+    "request_shape_error": "请求方式待适配",
     "quota_or_rate_limited": "额度用尽/限流",
+    "permission_or_scope_missing": "登录有效/API权限不足",
     "forbidden_or_banned": "权限不足/账号禁用",
     "auth_invalid": "认证失效/需要重新登录",
     "expired_locally": "本地判断已过期",
@@ -33,6 +39,11 @@ STATUS_CN = {
 
 CLEANUP_STATUS_OPTIONS = [
     ("forbidden_or_banned", "权限/禁用", True),
+    ("codex_login_only", "Codex登录/API不足", False),
+    ("sub2api_compatible", "Sub2API兼容", False),
+    ("model_unsupported", "模型不支持", False),
+    ("request_shape_error", "请求待适配", False),
+    ("permission_or_scope_missing", "登录有效/API权限不足", False),
     ("auth_invalid", "认证失败", True),
     ("expired_locally", "本地过期", False),
     ("unsupported", "格式不支持", False),
@@ -51,6 +62,7 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         "name",
         "platform",
         "type",
+        "source_format",
         "account_id",
         "http_status",
         "latency_ms",
@@ -59,6 +71,7 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         "model",
         "endpoint",
         "attempts",
+        "raw_meta",
         "source_file",
         "fingerprint",
     ]
@@ -77,12 +90,12 @@ class BatchCheckerApp(tk.Tk):
 
         self.selected_paths: list[Path] = [DEFAULT_INPUT]
         self.input_var = tk.StringVar(value=str(DEFAULT_INPUT))
-        self.mode_var = tk.StringVar(value="models")
+        self.mode_var = tk.StringVar(value="sub2api_oauth")
         self.concurrency_var = tk.IntVar(value=20)
         self.timeout_var = tk.IntVar(value=12)
         self.refresh_var = tk.BooleanVar(value=False)
-        self.use_proxy_var = tk.BooleanVar(value=False)
-        self.proxy_url_var = tk.StringVar(value="http://127.0.0.1:7897")
+        self.use_proxy_var = tk.BooleanVar(value=True)
+        self.proxy_url_var = tk.StringVar(value=DEFAULT_PROXY)
         self.limit_var = tk.StringVar(value="")
         self.cleanup_status_vars = {
             status: tk.BooleanVar(value=checked) for status, _label, checked in CLEANUP_STATUS_OPTIONS
@@ -138,16 +151,34 @@ class BatchCheckerApp(tk.Tk):
         mode_row.pack(fill=tk.X, pady=3)
         ttk.Radiobutton(
             mode_row,
-            text="轻量验活：只测登录/认证，不消耗推理额度",
+            text="轻量验活：只测认证是否还活，不代表一定能推理",
             variable=self.mode_var,
             value="models",
         ).pack(side=tk.LEFT, padx=(0, 24))
         ttk.Radiobutton(
             mode_row,
-            text="真实调用验活：会发起最小模型请求，可能消耗少量额度",
+            text="官方API真实调用：直连 api.openai.com，可能消耗少量额度",
             variable=self.mode_var,
             value="responses",
         ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            mode_row,
+            text="Sub2API兼容验活：适合 OAuth/Codex 账号，不直连官方 Responses",
+            variable=self.mode_var,
+            value="sub2api_oauth",
+        ).pack(side=tk.LEFT, padx=(24, 0))
+        ttk.Radiobutton(
+            mode_row,
+            text="Codex登录诊断：只测 ChatGPT/Codex 登录链路，不判坏",
+            variable=self.mode_var,
+            value="codex_login",
+        ).pack(side=tk.LEFT, padx=(24, 0))
+        ttk.Radiobutton(
+            mode_row,
+            text="Codex真实诊断：调用 Codex 后端，可能较慢",
+            variable=self.mode_var,
+            value="codex_real",
+        ).pack(side=tk.LEFT, padx=(24, 0))
 
         advanced_row = ttk.Frame(options)
         advanced_row.pack(fill=tk.X, pady=(10, 0))
@@ -223,8 +254,8 @@ class BatchCheckerApp(tk.Tk):
 
     def choose_file(self) -> None:
         path = filedialog.askopenfilename(
-            title="选择 Sub2API JSON 文件",
-            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            title="选择 Sub2API JSON 或 ZIP 文件",
+            filetypes=[("JSON/ZIP 文件", "*.json *.zip"), ("JSON 文件", "*.json"), ("ZIP 文件", "*.zip"), ("所有文件", "*.*")],
         )
         if path:
             self.selected_paths = [Path(path)]
@@ -232,8 +263,8 @@ class BatchCheckerApp(tk.Tk):
 
     def choose_files(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="选择一个或多个 token JSON 文件",
-            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            title="选择一个或多个 token JSON/ZIP 文件",
+            filetypes=[("JSON/ZIP 文件", "*.json *.zip"), ("JSON 文件", "*.json"), ("ZIP 文件", "*.zip"), ("所有文件", "*.*")],
         )
         if paths:
             self.selected_paths = [Path(path) for path in paths]
@@ -375,8 +406,20 @@ class BatchCheckerApp(tk.Tk):
         suffix = "models"
         if self.mode_var.get() == "responses":
             endpoint = "https://api.openai.com/v1/responses"
-            mode_name = "真实调用验活"
+            mode_name = "官方 API 真实调用"
             suffix = "responses"
+        elif self.mode_var.get() == "sub2api_oauth":
+            endpoint = SUB2API_OAUTH_COMPAT_URL
+            mode_name = "Sub2API 兼容验活"
+            suffix = "sub2api_oauth"
+        elif self.mode_var.get() == "codex_login":
+            endpoint = CHATGPT_ME_URL
+            mode_name = "Codex 登录诊断"
+            suffix = "codex_login"
+        elif self.mode_var.get() == "codex_real":
+            endpoint = CHATGPT_CODEX_RESPONSES_URL
+            mode_name = "Codex 真实诊断"
+            suffix = "codex_real"
 
         proxy_url = self.proxy_url_var.get().strip() if self.use_proxy_var.get() else ""
         if self.use_proxy_var.get() and not proxy_url:
@@ -388,12 +431,25 @@ class BatchCheckerApp(tk.Tk):
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.last_run_dir = OUTPUT_DIR / f"{suffix}_{timestamp}"
-        self.last_good_dir = self.last_run_dir / "可用账号"
-        self.last_bad_dir = self.last_run_dir / "坏账号"
-        self.last_bad_original_dir = self.last_bad_dir / "坏账号原始JSON副本"
+        if self.mode_var.get() in {"responses", "codex_real"}:
+            good_label = "API可用账号"
+            bad_label = "API不可用账号"
+        elif self.mode_var.get() == "sub2api_oauth":
+            good_label = "Sub2API兼容可用账号"
+            bad_label = "Sub2API兼容异常账号"
+        elif self.mode_var.get() == "codex_login":
+            good_label = "Codex登录有效账号"
+            bad_label = "Codex登录异常账号"
+        else:
+            good_label = "认证通过或待确认账号"
+            bad_label = "认证失败账号"
+
+        self.last_good_dir = self.last_run_dir / good_label
+        self.last_bad_dir = self.last_run_dir / bad_label
+        self.last_bad_original_dir = self.last_bad_dir / f"{bad_label}原始JSON副本"
         self.last_csv = self.last_run_dir / "验活总表.csv"
-        self.last_good = self.last_good_dir / "sub2api_可用账号导入包.json"
-        self.last_bad = self.last_bad_dir / "sub2api_坏账号包.json"
+        self.last_good = self.last_good_dir / f"sub2api_{good_label}导入包.json"
+        self.last_bad = self.last_bad_dir / f"sub2api_{bad_label}包.json"
         self.last_bad_source_groups = {}
 
         self.running = True
@@ -408,6 +464,8 @@ class BatchCheckerApp(tk.Tk):
         if len(input_paths) > 10:
             self._append_log(f"  ... 还有 {len(input_paths) - 10} 个")
         self._append_log(f"模式：{mode_name}")
+        if self.mode_var.get() in {"models", "responses"}:
+            self._append_log("提醒：官方 API 检测失败不等于 Sub2API 不可用；OAuth/Codex/CPA 账号建议优先用 Sub2API 兼容验活。")
         self._append_log(f"并发：{concurrency}，超时：{int(timeout)} 秒")
         self._append_log(f"代理：{'启用 ' + proxy_url if proxy_url else '未启用'}")
         self._append_log(f"本次结果目录：{self.last_run_dir}")
@@ -571,6 +629,11 @@ class BatchCheckerApp(tk.Tk):
         priority = [
             "network_or_proxy",
             "quota_or_rate_limited",
+            "codex_login_only",
+            "sub2api_compatible",
+            "model_unsupported",
+            "request_shape_error",
+            "permission_or_scope_missing",
             "forbidden_or_banned",
             "auth_invalid",
             "expired_locally",
@@ -587,6 +650,11 @@ class BatchCheckerApp(tk.Tk):
         names = {
             "network_or_proxy": "网络代理失败_建议开代理复测",
             "quota_or_rate_limited": "额度用尽或限流_暂不删除",
+            "codex_login_only": "Codex登录有效但API权限不足_暂不删除",
+            "sub2api_compatible": "Sub2API兼容可用_暂不删除",
+            "model_unsupported": "模型不支持或请求方式待适配_暂不删除",
+            "request_shape_error": "请求方式待适配_暂不删除",
+            "permission_or_scope_missing": "登录有效但API权限不足_暂不删除",
             "forbidden_or_banned": "权限不足或账号禁用",
             "auth_invalid": "认证失效需要重新登录",
             "expired_locally": "本地判断已过期",

@@ -1,0 +1,4 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+*/2 * * * * root /opt/sub2api/ops/run_cloud_maintenance.sh >> /opt/sub2api/logs/cloud-maintenance.log 2>&1

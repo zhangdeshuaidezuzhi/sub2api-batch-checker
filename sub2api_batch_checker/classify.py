@@ -6,6 +6,79 @@ from .models import HealthStatus
 def classify_failure(http_status: int | None, message: str, error_code: str = "") -> HealthStatus:
     text = f"{error_code} {message}".lower()
 
+    if any(
+        token in text
+        for token in [
+            "model is not supported",
+            "model not supported",
+            "模型不支持",
+        ]
+    ):
+        return "model_unsupported"
+
+    if any(
+        token in text
+        for token in [
+            "insufficient permissions",
+            "missing scopes",
+            "missing scope",
+            "correct role",
+            "api.model.read",
+            "api.responses",
+            "permission",
+            "permissions",
+            "scope",
+            "scopes",
+            "role",
+            "权限不足",
+            "缺少权限",
+            "范围",
+            "角色",
+        ]
+    ):
+        return "permission_or_scope_missing"
+
+    if any(
+        token in text
+        for token in [
+            "instructions are required",
+            "missing required parameter",
+            "missing required field",
+            "invalid request body",
+            "invalid request format",
+            "request body",
+            "stream must be set to true",
+            "unsupported parameter",
+            "请求格式",
+            "请求体",
+            "缺少必填",
+        ]
+    ):
+        return "request_shape_error"
+
+    if http_status == 429 or any(
+        token in text
+        for token in [
+            "rate limit",
+            "rate_limit",
+            "quota",
+            "insufficient_quota",
+            "usage limit",
+            "weekly limit",
+            "weekly quota",
+            "week limit",
+            "billing",
+            "too many requests",
+            "额度",
+            "余额",
+            "用尽",
+            "限流",
+            "周限额",
+            "本周限额",
+        ]
+    ):
+        return "quota_or_rate_limited"
+
     if http_status == 401 or any(
         token in text
         for token in [
@@ -44,24 +117,6 @@ def classify_failure(http_status: int | None, message: str, error_code: str = ""
         ]
     ):
         return "forbidden_or_banned"
-
-    if http_status == 429 or any(
-        token in text
-        for token in [
-            "rate limit",
-            "rate_limit",
-            "quota",
-            "insufficient_quota",
-            "usage limit",
-            "billing",
-            "too many requests",
-            "额度",
-            "余额",
-            "用尽",
-            "限流",
-        ]
-    ):
-        return "quota_or_rate_limited"
 
     if any(
         token in text

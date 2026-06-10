@@ -18,6 +18,7 @@ outputs/
 token_*.json
 tokens/
 sub_json/
+tmp_refs/
 
 # Local configuration
 .env
