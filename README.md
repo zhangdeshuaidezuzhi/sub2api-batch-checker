@@ -130,6 +130,10 @@ $env:SUB2API_CLOUD_SSH_KEY = "C:\path\to\key"
 $env:SUB2API_CLOUD_SSH_TARGET = "user@host"
 ```
 
+## 云端号池维护
+
+`ops/sub2api_cloud_maintenance.py` 只维护 OAuth/token JSON 账号，不处理 `type=apikey` 上游账号。维护入口会分批探测历史遗留的 `active + schedulable=false` 且没有 reset/reason/probe 标记的 OAuth 账号：探针 ok 就恢复调度，明确认证失效、封禁或额度耗尽就软删除，临时限流或网络失败累计到阈值后再清理。
+
 ## 状态分类
 
 - `ok`：可用

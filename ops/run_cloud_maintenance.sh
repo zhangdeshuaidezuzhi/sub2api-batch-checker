@@ -13,6 +13,7 @@ exec flock -n /tmp/sub2api-cloud-maintenance.lock \
     --probe-active \
     --probe-limit 50 \
     --recover-probe-limit 20 \
+    --legacy-unschedulable-probe-limit 50 \
     --recover-delete-after-failures 3 \
     --probe-min-interval-hours 1 \
     --probe-timeout 20 \

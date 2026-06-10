@@ -17,6 +17,7 @@ def _args(threshold=3):
         probe_limit=10,
         probe_min_interval_hours=1,
         recover_probe_limit=10,
+        legacy_unschedulable_probe_limit=10,
         probe_model="gpt-5.5",
         probe_timeout=20,
         temporary_usage_limit_max_seconds=12 * 60 * 60,
@@ -252,3 +253,58 @@ def test_shorten_long_temporary_pauses_only_updates_oauth(monkeypatch) -> None:
 
     assert cloud.shorten_long_temporary_pauses(True, 10) == 0
     assert "type = 'oauth'" in sql_calls[-1]
+
+
+def test_legacy_unschedulable_candidates_are_oauth_unmarked(monkeypatch) -> None:
+    sql_calls = []
+
+    def fake_run_sql(sql):
+        sql_calls.append(sql)
+        if "to_regclass" in sql:
+            return ""
+        return "id,name,platform,type,credentials,extra,proxy_protocol,proxy_host,proxy_port,proxy_username,proxy_password,last_probe_at,recovery_probe_failures,previous_probe_result\n"
+
+    monkeypatch.setattr(cloud, "run_sql", fake_run_sql)
+
+    assert cloud.load_legacy_unschedulable_candidates(5, 1) == []
+    query = sql_calls[-1]
+    assert "a.type = 'oauth'" in query
+    assert "a.schedulable = false" in query
+    assert "a.rate_limit_reset_at IS NULL" in query
+    assert "a.temp_unschedulable_until IS NULL" in query
+    assert "coalesce(a.temp_unschedulable_reason, '') = ''" in query
+
+
+def test_legacy_unschedulable_probe_ok_recovers(monkeypatch) -> None:
+    recorded = []
+    recovered = []
+    monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
+    monkeypatch.setattr(cloud, "load_legacy_unschedulable_candidates", lambda limit, interval: [_row(2)])
+    monkeypatch.setattr(cloud, "active_probe_account", lambda *args: _result("ok"))
+    monkeypatch.setattr(cloud, "record_probe_state", lambda result, apply, count=None: recorded.append(count))
+    monkeypatch.setattr(cloud, "apply_recovery", lambda result, now_iso: recovered.append(result["account_id"]))
+
+    decisions, _, candidate_count, recovered_count = cloud.run_legacy_unschedulable_probes(_args(), "2026-06-10T00:00:00+00:00")
+
+    assert candidate_count == 1
+    assert decisions == []
+    assert recovered_count == 1
+    assert recorded == [0]
+    assert recovered == [101]
+
+
+def test_legacy_unschedulable_probe_failure_at_threshold_deletes(monkeypatch) -> None:
+    recorded = []
+    monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
+    monkeypatch.setattr(cloud, "load_legacy_unschedulable_candidates", lambda limit, interval: [_row(2)])
+    monkeypatch.setattr(cloud, "active_probe_account", lambda *args: _result("temporary_rate_limit"))
+    monkeypatch.setattr(cloud, "record_probe_state", lambda result, apply, count=None: recorded.append(count))
+
+    decisions, _, candidate_count, recovered_count = cloud.run_legacy_unschedulable_probes(_args(), "2026-06-10T00:00:00+00:00")
+
+    assert candidate_count == 1
+    assert recovered_count == 0
+    assert recorded == [3]
+    assert len(decisions) == 1
+    assert decisions[0].action == "soft_delete"
+    assert decisions[0].reason == "legacy_unschedulable_failed_3_times"

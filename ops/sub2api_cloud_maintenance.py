@@ -905,6 +905,67 @@ COPY (
     return list(csv.DictReader(StringIO(out)))
 
 
+def load_legacy_unschedulable_candidates(limit, min_interval_hours):
+    if int(limit) <= 0:
+        return []
+    state_table_exists = run_sql("SELECT to_regclass('public.ops_account_active_probe_state');").strip()
+    if state_table_exists:
+        state_join = "LEFT JOIN ops_account_active_probe_state s ON s.account_id = a.id"
+        state_column = """
+         coalesce(s.last_probe_at::text, '') AS last_probe_at,
+         coalesce(s.recovery_probe_failures::text, '0') AS recovery_probe_failures,
+         coalesce(s.last_result, '') AS previous_probe_result
+"""
+        state_filter = "AND (s.last_probe_at IS NULL OR s.last_probe_at < now() - interval '{0} hours')".format(
+            int(min_interval_hours)
+        )
+        state_order = "s.last_probe_at ASC NULLS FIRST,"
+    else:
+        state_join = ""
+        state_column = """
+         '' AS last_probe_at,
+         '0' AS recovery_probe_failures,
+         '' AS previous_probe_result
+"""
+        state_filter = ""
+        state_order = ""
+    sql = f"""
+COPY (
+  SELECT a.id,
+         a.name,
+         a.platform,
+         a.type,
+         a.credentials::text AS credentials,
+         coalesce(a.extra::text, '{{}}') AS extra,
+         coalesce(p.protocol, '') AS proxy_protocol,
+         coalesce(p.host, '') AS proxy_host,
+         coalesce(p.port::text, '') AS proxy_port,
+         coalesce(p.username, '') AS proxy_username,
+         coalesce(p.password, '') AS proxy_password,
+         {state_column}
+  FROM accounts a
+  LEFT JOIN proxies p ON p.id = a.proxy_id AND p.deleted_at IS NULL AND p.status = 'active'
+  {state_join}
+  WHERE a.deleted_at IS NULL
+    AND a.status = 'active'
+    AND a.schedulable = false
+    AND a.platform = 'openai'
+    AND a.type = 'oauth'
+    AND a.rate_limit_reset_at IS NULL
+    AND a.temp_unschedulable_until IS NULL
+    AND coalesce(a.temp_unschedulable_reason, '') = ''
+    {state_filter}
+  ORDER BY {state_order} coalesce(a.last_used_at, a.updated_at, a.created_at) ASC NULLS FIRST, a.id ASC
+  LIMIT {int(limit)}
+) TO STDOUT WITH CSV HEADER;
+"""
+    out = run_sql(sql)
+    import csv
+    from io import StringIO
+
+    return list(csv.DictReader(StringIO(out)))
+
+
 def shorten_long_temporary_pauses(apply, temporary_rate_pause_minutes):
     reset_sql = "now() + interval '{0} minutes'".format(max(1, int(temporary_rate_pause_minutes)))
     text_expr = "coalesce(temp_unschedulable_reason, '') || ' ' || coalesce(error_message, '')"
@@ -1304,6 +1365,116 @@ def run_active_probes(args, now_iso):
     return decisions, results, len(candidates)
 
 
+def run_legacy_unschedulable_probes(args, now_iso):
+    ensure_probe_state_table(args.apply)
+    candidates = load_legacy_unschedulable_candidates(
+        args.legacy_unschedulable_probe_limit,
+        args.probe_min_interval_hours,
+    )
+    if not args.apply:
+        return [], [], len(candidates), 0
+
+    decisions = []
+    results = []
+    recovered_count = 0
+    for row in candidates:
+        previous_failures = active_probe_failure_count_before(row)
+        result = active_probe_account(
+            row,
+            args.probe_model,
+            args.probe_timeout,
+            args.temporary_usage_limit_max_seconds,
+        )
+        results.append(result)
+
+        if result["result"] == "ok":
+            record_probe_state(result, True, 0)
+            apply_recovery(result, now_iso)
+            recovered_count += 1
+            continue
+        if result["result"] == "ignored_transient":
+            record_probe_state(result, True)
+            continue
+
+        probe_failures = previous_failures + 1 if is_counted_active_probe_failure(result["result"]) else previous_failures
+        if result["result"] in ("usage_quota_exhausted", "banned_or_forbidden"):
+            probe_failures = previous_failures + 1
+        record_probe_state(result, True, probe_failures)
+
+        if result["result"] == "usage_quota_exhausted":
+            decisions.append(
+                Decision(
+                    result["account_id"],
+                    "soft_delete",
+                    "legacy_unschedulable_usage_quota_exhausted",
+                    max(1, probe_failures),
+                    now_iso,
+                    result.get("message", ""),
+                )
+            )
+        elif result["result"] == "banned_or_forbidden":
+            decisions.append(
+                Decision(
+                    result["account_id"],
+                    "soft_delete",
+                    "legacy_unschedulable_banned_or_forbidden",
+                    max(1, probe_failures),
+                    now_iso,
+                    result.get("message", ""),
+                )
+            )
+        elif is_temporary_limit_result(result["result"]):
+            if should_delete_after_recovery_failure(probe_failures, args.recover_delete_after_failures):
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "soft_delete",
+                        "legacy_unschedulable_failed_{0}_times".format(probe_failures),
+                        probe_failures,
+                        now_iso,
+                        result.get("message", ""),
+                    )
+                )
+            else:
+                reset_sql, reset_source = parse_reset_hint(result.get("message", ""))
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "pause_usage_limited",
+                        "legacy_unschedulable_" + result["result"],
+                        probe_failures,
+                        now_iso,
+                        result.get("message", ""),
+                        reset_sql,
+                        reset_source,
+                    )
+                )
+        elif result["result"] in ("auth_invalid_probe_only", "probe_skipped_missing_access_token"):
+            decisions.append(
+                Decision(
+                    result["account_id"],
+                    "soft_delete",
+                    "legacy_unschedulable_auth_invalid_probe_only",
+                    max(1, probe_failures),
+                    now_iso,
+                    result.get("message", ""),
+                )
+            )
+        elif result["result"] in ("probe_failed_unknown", "probe_network_or_proxy"):
+            if should_delete_after_recovery_failure(probe_failures, args.recover_delete_after_failures):
+                decisions.append(
+                    Decision(
+                        result["account_id"],
+                        "soft_delete",
+                        "legacy_unschedulable_failed_{0}_times".format(probe_failures),
+                        probe_failures,
+                        now_iso,
+                        result.get("message", ""),
+                    )
+                )
+    return decisions, results, len(candidates), recovered_count
+
+
 def evidence_message(row):
     return " ".join(
         [
@@ -1500,7 +1671,11 @@ SET schedulable = false,
     updated_at = now()
 WHERE id = {decision.account_id}
   AND deleted_at IS NULL
-  AND (schedulable = true OR coalesce(temp_unschedulable_reason, '') LIKE 'cloud-maintenance:%');
+  AND (
+    schedulable = true
+    OR coalesce(temp_unschedulable_reason, '') LIKE 'cloud-maintenance:%'
+    OR coalesce(temp_unschedulable_reason, '') = ''
+  );
 {audit_sql}
 COMMIT;
 """
@@ -1685,6 +1860,7 @@ def main():
     parser.add_argument("--probe-active", action="store_true", help="Actively probe a rotating sample of schedulable OAuth accounts.")
     parser.add_argument("--probe-limit", type=int, default=0, help="Maximum active probes this run. 0 disables active probing.")
     parser.add_argument("--recover-probe-limit", type=int, default=10, help="Maximum expired temporary 429 pauses to probe this run.")
+    parser.add_argument("--legacy-unschedulable-probe-limit", type=int, default=0, help="Maximum legacy unmarked unschedulable OAuth accounts to probe this run. 0 disables.")
     parser.add_argument("--recover-delete-after-failures", type=int, default=DEFAULT_RECOVER_DELETE_AFTER_FAILURES, help="Soft-delete an expired temporary pause after this many consecutive recovery probe failures. 0 disables.")
     parser.add_argument("--probe-min-interval-hours", type=int, default=24)
     parser.add_argument("--probe-timeout", type=float, default=20.0)
@@ -1741,6 +1917,9 @@ def main():
     shortened_temporary_pause_count = shorten_long_temporary_pauses(args.apply, args.temporary_rate_pause_minutes)
     recovery_decisions, recovery_results, recovery_candidate_count, recovered_count = run_expired_pause_recovery(args, now_iso)
     decisions.extend(recovery_decisions)
+    legacy_decisions, legacy_results, legacy_candidate_count, legacy_recovered_count = run_legacy_unschedulable_probes(args, now_iso)
+    decisions.extend(legacy_decisions)
+    recovered_count += legacy_recovered_count
 
     if args.apply:
         ensure_audit_table(True)
@@ -1760,6 +1939,8 @@ def main():
         "active_probe_result_count": len(active_probe_results),
         "expired_pause_recovery_candidate_count": recovery_candidate_count,
         "expired_pause_recovery_result_count": len(recovery_results),
+        "legacy_unschedulable_candidate_count": legacy_candidate_count,
+        "legacy_unschedulable_result_count": len(legacy_results),
         "recover_delete_after_failures": args.recover_delete_after_failures,
         "shortened_temporary_pause_count": shortened_temporary_pause_count,
         "decision_count": len(decisions),
@@ -1767,6 +1948,7 @@ def main():
         "decisions": [decision.as_dict() for decision in decisions],
         "active_probe_results": active_probe_results,
         "expired_pause_recovery_results": recovery_results,
+        "legacy_unschedulable_results": legacy_results,
     }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
