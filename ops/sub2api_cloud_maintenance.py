@@ -966,6 +966,67 @@ COPY (
     return list(csv.DictReader(StringIO(out)))
 
 
+def load_stale_marked_unschedulable_candidates(limit, min_interval_hours):
+    if int(limit) <= 0:
+        return []
+    state_table_exists = run_sql("SELECT to_regclass('public.ops_account_active_probe_state');").strip()
+    if state_table_exists:
+        state_join = "LEFT JOIN ops_account_active_probe_state s ON s.account_id = a.id"
+        state_column = """
+         coalesce(s.last_probe_at::text, '') AS last_probe_at,
+         coalesce(s.recovery_probe_failures::text, '0') AS recovery_probe_failures,
+         coalesce(s.last_result, '') AS previous_probe_result
+"""
+        state_filter = "AND (s.last_probe_at IS NULL OR s.last_probe_at < now() - interval '{0} hours')".format(
+            int(min_interval_hours)
+        )
+        state_order = "s.last_probe_at ASC NULLS FIRST,"
+    else:
+        state_join = ""
+        state_column = """
+         '' AS last_probe_at,
+         '0' AS recovery_probe_failures,
+         '' AS previous_probe_result
+"""
+        state_filter = ""
+        state_order = ""
+    sql = f"""
+COPY (
+  SELECT a.id,
+         a.name,
+         a.platform,
+         a.type,
+         a.credentials::text AS credentials,
+         coalesce(a.extra::text, '{{}}') AS extra,
+         coalesce(p.protocol, '') AS proxy_protocol,
+         coalesce(p.host, '') AS proxy_host,
+         coalesce(p.port::text, '') AS proxy_port,
+         coalesce(p.username, '') AS proxy_username,
+         coalesce(p.password, '') AS proxy_password,
+         {state_column}
+  FROM accounts a
+  LEFT JOIN proxies p ON p.id = a.proxy_id AND p.deleted_at IS NULL AND p.status = 'active'
+  {state_join}
+  WHERE a.deleted_at IS NULL
+    AND a.status = 'active'
+    AND a.schedulable = false
+    AND a.platform = 'openai'
+    AND a.type = 'oauth'
+    AND a.temp_unschedulable_until IS NULL
+    AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at <= now())
+    AND coalesce(a.temp_unschedulable_reason, '') LIKE 'cloud-maintenance:%'
+    {state_filter}
+  ORDER BY {state_order} coalesce(a.last_used_at, a.updated_at, a.created_at) ASC NULLS FIRST, a.id ASC
+  LIMIT {int(limit)}
+) TO STDOUT WITH CSV HEADER;
+"""
+    out = run_sql(sql)
+    import csv
+    from io import StringIO
+
+    return list(csv.DictReader(StringIO(out)))
+
+
 def shorten_long_temporary_pauses(apply, temporary_rate_pause_minutes):
     reset_sql = "now() + interval '{0} minutes'".format(max(1, int(temporary_rate_pause_minutes)))
     text_expr = "coalesce(temp_unschedulable_reason, '') || ' ' || coalesce(error_message, '')"
@@ -1365,15 +1426,7 @@ def run_active_probes(args, now_iso):
     return decisions, results, len(candidates)
 
 
-def run_legacy_unschedulable_probes(args, now_iso):
-    ensure_probe_state_table(args.apply)
-    candidates = load_legacy_unschedulable_candidates(
-        args.legacy_unschedulable_probe_limit,
-        args.probe_min_interval_hours,
-    )
-    if not args.apply:
-        return [], [], len(candidates), 0
-
+def run_unschedulable_probe_batch(candidates, args, now_iso, reason_prefix):
     decisions = []
     results = []
     recovered_count = 0
@@ -1406,7 +1459,7 @@ def run_legacy_unschedulable_probes(args, now_iso):
                 Decision(
                     result["account_id"],
                     "soft_delete",
-                    "legacy_unschedulable_usage_quota_exhausted",
+                    reason_prefix + "_usage_quota_exhausted",
                     max(1, probe_failures),
                     now_iso,
                     result.get("message", ""),
@@ -1417,7 +1470,7 @@ def run_legacy_unschedulable_probes(args, now_iso):
                 Decision(
                     result["account_id"],
                     "soft_delete",
-                    "legacy_unschedulable_banned_or_forbidden",
+                    reason_prefix + "_banned_or_forbidden",
                     max(1, probe_failures),
                     now_iso,
                     result.get("message", ""),
@@ -1429,7 +1482,7 @@ def run_legacy_unschedulable_probes(args, now_iso):
                     Decision(
                         result["account_id"],
                         "soft_delete",
-                        "legacy_unschedulable_failed_{0}_times".format(probe_failures),
+                        reason_prefix + "_failed_{0}_times".format(probe_failures),
                         probe_failures,
                         now_iso,
                         result.get("message", ""),
@@ -1441,7 +1494,7 @@ def run_legacy_unschedulable_probes(args, now_iso):
                     Decision(
                         result["account_id"],
                         "pause_usage_limited",
-                        "legacy_unschedulable_" + result["result"],
+                        reason_prefix + "_" + result["result"],
                         probe_failures,
                         now_iso,
                         result.get("message", ""),
@@ -1454,7 +1507,7 @@ def run_legacy_unschedulable_probes(args, now_iso):
                 Decision(
                     result["account_id"],
                     "soft_delete",
-                    "legacy_unschedulable_auth_invalid_probe_only",
+                    reason_prefix + "_auth_invalid_probe_only",
                     max(1, probe_failures),
                     now_iso,
                     result.get("message", ""),
@@ -1466,13 +1519,35 @@ def run_legacy_unschedulable_probes(args, now_iso):
                     Decision(
                         result["account_id"],
                         "soft_delete",
-                        "legacy_unschedulable_failed_{0}_times".format(probe_failures),
+                        reason_prefix + "_failed_{0}_times".format(probe_failures),
                         probe_failures,
                         now_iso,
                         result.get("message", ""),
                     )
                 )
     return decisions, results, len(candidates), recovered_count
+
+
+def run_legacy_unschedulable_probes(args, now_iso):
+    ensure_probe_state_table(args.apply)
+    candidates = load_legacy_unschedulable_candidates(
+        args.legacy_unschedulable_probe_limit,
+        args.probe_min_interval_hours,
+    )
+    if not args.apply:
+        return [], [], len(candidates), 0
+    return run_unschedulable_probe_batch(candidates, args, now_iso, "legacy_unschedulable")
+
+
+def run_stale_marked_unschedulable_probes(args, now_iso):
+    ensure_probe_state_table(args.apply)
+    candidates = load_stale_marked_unschedulable_candidates(
+        args.stale_marked_unschedulable_probe_limit,
+        args.probe_min_interval_hours,
+    )
+    if not args.apply:
+        return [], [], len(candidates), 0
+    return run_unschedulable_probe_batch(candidates, args, now_iso, "stale_marked_unschedulable")
 
 
 def evidence_message(row):
@@ -1861,6 +1936,7 @@ def main():
     parser.add_argument("--probe-limit", type=int, default=0, help="Maximum active probes this run. 0 disables active probing.")
     parser.add_argument("--recover-probe-limit", type=int, default=10, help="Maximum expired temporary 429 pauses to probe this run.")
     parser.add_argument("--legacy-unschedulable-probe-limit", type=int, default=0, help="Maximum legacy unmarked unschedulable OAuth accounts to probe this run. 0 disables.")
+    parser.add_argument("--stale-marked-unschedulable-probe-limit", type=int, default=0, help="Maximum cloud-maintenance marked unschedulable OAuth accounts without reset time to probe this run. 0 disables.")
     parser.add_argument("--recover-delete-after-failures", type=int, default=DEFAULT_RECOVER_DELETE_AFTER_FAILURES, help="Soft-delete an expired temporary pause after this many consecutive recovery probe failures. 0 disables.")
     parser.add_argument("--probe-min-interval-hours", type=int, default=24)
     parser.add_argument("--probe-timeout", type=float, default=20.0)
@@ -1920,6 +1996,9 @@ def main():
     legacy_decisions, legacy_results, legacy_candidate_count, legacy_recovered_count = run_legacy_unschedulable_probes(args, now_iso)
     decisions.extend(legacy_decisions)
     recovered_count += legacy_recovered_count
+    stale_decisions, stale_results, stale_candidate_count, stale_recovered_count = run_stale_marked_unschedulable_probes(args, now_iso)
+    decisions.extend(stale_decisions)
+    recovered_count += stale_recovered_count
 
     if args.apply:
         ensure_audit_table(True)
@@ -1941,6 +2020,8 @@ def main():
         "expired_pause_recovery_result_count": len(recovery_results),
         "legacy_unschedulable_candidate_count": legacy_candidate_count,
         "legacy_unschedulable_result_count": len(legacy_results),
+        "stale_marked_unschedulable_candidate_count": stale_candidate_count,
+        "stale_marked_unschedulable_result_count": len(stale_results),
         "recover_delete_after_failures": args.recover_delete_after_failures,
         "shortened_temporary_pause_count": shortened_temporary_pause_count,
         "decision_count": len(decisions),
@@ -1949,6 +2030,7 @@ def main():
         "active_probe_results": active_probe_results,
         "expired_pause_recovery_results": recovery_results,
         "legacy_unschedulable_results": legacy_results,
+        "stale_marked_unschedulable_results": stale_results,
     }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
