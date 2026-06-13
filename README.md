@@ -119,7 +119,7 @@ Windows 也可以把 good 包拖到：
 注册机results兜底导入云端.cmd
 ```
 
-两个入口都可以拖入或传入 `D:\注册机最新版\results` 下的某个 `批次_*` 目录；不传参数时默认扫描整个 `results`。工具只导入 `access_token + id_token` 完整记录，缺字段记录会写入 skipped 文件，不进入云端。
+两个入口都可以拖入或传入 `D:\注册机最新版\results` 下的某个 `批次_*` 目录。默认空参数会记住进度：第一次正式导入扫描整个 `results`，成功后写入本地 state；以后空参数只扫描最新 `批次_*`。需要覆盖时可传 `full` 强制全量，传 `latest` 强制最新批次。工具只导入 `access_token + id_token` 完整记录，缺字段记录会写入 skipped 文件，不进入云端。
 
 ## 上游 API key 检测并导入
 
