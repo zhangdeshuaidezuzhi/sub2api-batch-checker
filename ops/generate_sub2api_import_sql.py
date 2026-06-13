@@ -176,6 +176,51 @@ def build_insert_sql(account, import_tag, index):
   VALUES
     {group_values}
 ),
+incoming_account AS (
+  SELECT
+    {name}::varchar AS name,
+    {platform}::varchar AS platform,
+    {type}::varchar AS type,
+    {credentials}::jsonb AS credentials
+),
+existing_account AS (
+  SELECT a.id, a.name
+  FROM accounts a
+  CROSS JOIN incoming_account i
+  WHERE a.deleted_at IS NULL
+    AND a.platform = i.platform
+    AND a.type = i.type
+    AND (
+      a.name = i.name
+      OR (
+        nullif(i.credentials ->> 'access_token', '') IS NOT NULL
+        AND a.credentials ->> 'access_token' = i.credentials ->> 'access_token'
+      )
+      OR (
+        nullif(i.credentials ->> 'chatgpt_account_id', '') IS NOT NULL
+        AND a.credentials ->> 'chatgpt_account_id' = i.credentials ->> 'chatgpt_account_id'
+      )
+      OR (
+        nullif(i.credentials ->> 'chatgpt_user_id', '') IS NOT NULL
+        AND a.credentials ->> 'chatgpt_user_id' = i.credentials ->> 'chatgpt_user_id'
+      )
+      OR (
+        nullif(i.credentials ->> 'email', '') IS NOT NULL
+        AND lower(a.credentials ->> 'email') = lower(i.credentials ->> 'email')
+      )
+      OR (
+        nullif(i.credentials ->> 'api_key', '') IS NOT NULL
+        AND nullif(i.credentials ->> 'base_url', '') IS NOT NULL
+        AND a.credentials ->> 'api_key' = i.credentials ->> 'api_key'
+        AND regexp_replace(lower(coalesce(a.credentials ->> 'base_url', '')), '/+$', '') =
+            regexp_replace(lower(i.credentials ->> 'base_url'), '/+$', '')
+      )
+    )
+  ORDER BY
+    CASE WHEN a.name = i.name THEN 0 ELSE 1 END,
+    a.id
+  LIMIT 1
+),
 resolved_groups AS (
   SELECT DISTINCT g.id
   FROM groups g
@@ -221,10 +266,10 @@ inserted AS (
     rate_multiplier
   )
   SELECT
-    {name},
-    {platform},
-    {type},
-    {credentials}::jsonb,
+    i.name,
+    i.platform,
+    i.type,
+    i.credentials,
     {extra}::jsonb,
     (SELECT proxy_id FROM selected_proxy),
     {concurrency},
@@ -234,22 +279,15 @@ inserted AS (
     {expires_at_sql},
     {auto_pause_on_expired},
     {rate_multiplier}::numeric
-  WHERE NOT EXISTS (
-    SELECT 1
-    FROM accounts
-    WHERE deleted_at IS NULL
-      AND name = {name}
-  )
+  FROM incoming_account i
+  WHERE NOT EXISTS (SELECT 1 FROM existing_account)
   RETURNING id, name
 ),
 target_account AS (
   SELECT id, name FROM inserted
   UNION ALL
-  SELECT id, name
-  FROM accounts
-  WHERE deleted_at IS NULL
-    AND name = {name}
-    AND NOT EXISTS (SELECT 1 FROM inserted)
+  SELECT id, name FROM existing_account
+  WHERE NOT EXISTS (SELECT 1 FROM inserted)
   LIMIT 1
 ),
 proxy_update AS (

@@ -23,6 +23,7 @@ from typing import Any
 
 
 SUMMARY_PREFIXES = ("汇总_", "原始汇总_")
+GENERATED_PREFIXES = ("sub2api_",)
 DEFAULT_RESULTS_DIR = Path(r"D:\注册机最新版\results")
 DEFAULT_OUTPUT_DIR = Path(r"D:\注册机最新版\sub2JOSN出售")
 
@@ -134,7 +135,7 @@ def record_score(record: dict[str, Any]) -> tuple[int, float]:
 
 def iter_raw_records(results_dir: Path):
     for path in sorted(results_dir.rglob("*.json")):
-        if path.name.startswith(SUMMARY_PREFIXES) or path.name == "_all.json":
+        if path.name.startswith(SUMMARY_PREFIXES) or path.name.startswith(GENERATED_PREFIXES) or path.name == "_all.json":
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))

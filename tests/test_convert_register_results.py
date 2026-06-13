@@ -83,3 +83,29 @@ def test_convert_register_results_bundle_can_generate_import_sql(tmp_path):
     sql = sqlgen.build_sql(str(bundle), accounts, "unit-test")
     assert "INSERT INTO accounts" in sql
     assert "user@example.com" in sql
+
+
+def test_convert_register_results_ignores_generated_sub2api_outputs(tmp_path):
+    results_dir = tmp_path / "results"
+    results_dir.mkdir(parents=True)
+    access = _jwt({"exp": 2000000000, "https://api.openai.com/profile": {"email": "user@example.com"}})
+    id_token = _jwt({"email": "user@example.com"})
+    generated = {
+        "accounts": [
+            {
+                "name": "generated@example.com",
+                "platform": "openai",
+                "type": "oauth",
+                "credentials": {"access_token": access, "id_token": id_token},
+            }
+        ]
+    }
+    (results_dir / "sub2api_register_fallback_1_20260613_000000.json").write_text(
+        json.dumps(generated),
+        encoding="utf-8",
+    )
+
+    summary = converter.convert_results(results_dir, tmp_path / "out")
+
+    assert summary["raw_records"] == 0
+    assert summary["accounts"] == 0

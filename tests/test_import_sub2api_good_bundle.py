@@ -129,6 +129,51 @@ def test_generate_sql_respects_explicit_group_name() -> None:
     assert "'测试组'::varchar" not in sql
 
 
+def test_generate_sql_dedupes_oauth_against_cloud_identity_fields() -> None:
+    sql = importer.sqlgen.build_insert_sql(
+        {
+            "name": "new-name@example.com",
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": {
+                "access_token": "dummy-access",
+                "chatgpt_account_id": "acc_123",
+                "chatgpt_user_id": "user_123",
+                "email": "user@example.com",
+            },
+        },
+        "unit-test",
+        1,
+    )
+
+    assert "existing_account AS" in sql
+    assert "a.credentials ->> 'access_token'" in sql
+    assert "a.credentials ->> 'chatgpt_account_id'" in sql
+    assert "a.credentials ->> 'chatgpt_user_id'" in sql
+    assert "lower(a.credentials ->> 'email')" in sql
+    assert "WHERE NOT EXISTS (SELECT 1 FROM existing_account)" in sql
+
+
+def test_generate_sql_dedupes_apikey_by_key_and_base_url() -> None:
+    sql = importer.sqlgen.build_insert_sql(
+        {
+            "name": "hub.example.com",
+            "platform": "openai",
+            "type": "apikey",
+            "credentials": {
+                "api_key": "sk-test",
+                "base_url": "https://hub.example.com/",
+            },
+        },
+        "unit-test",
+        1,
+    )
+
+    assert "a.credentials ->> 'api_key'" in sql
+    assert "a.credentials ->> 'base_url'" in sql
+    assert "regexp_replace(lower(coalesce(a.credentials ->> 'base_url', '')), '/+$', '')" in sql
+
+
 def test_dry_run_generates_sql_without_remote_calls(tmp_path, monkeypatch) -> None:
     bundle = tmp_path / "good.json"
     bundle.write_text(
