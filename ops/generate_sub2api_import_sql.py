@@ -325,6 +325,14 @@ group_links AS (
   CROSS JOIN resolved_groups rg
   WHERE NOT EXISTS (
     SELECT 1
+    FROM account_groups review_ag
+    JOIN groups review_g ON review_g.id = review_ag.group_id
+    WHERE review_ag.account_id = ta.id
+      AND review_g.name = '限流账号'
+      AND review_g.deleted_at IS NULL
+  )
+  AND NOT EXISTS (
+    SELECT 1
     FROM account_groups ag
     WHERE ag.account_id = ta.id
       AND ag.group_id = rg.id

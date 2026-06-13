@@ -152,6 +152,8 @@ $env:SUB2API_CLOUD_SSH_TARGET = "user@host"
 
 `ops/sub2api_cloud_maintenance.py` 只维护 OAuth/token JSON 账号，不处理 `type=apikey` 上游账号。维护入口会分批探测历史遗留的 `active + schedulable=false` 且没有 reset/reason/probe 标记的 OAuth 账号，也会处理已有 `cloud-maintenance:` 标记但缺少 reset 到期时间的卡死暂停账号：探针 ok 就恢复调度，明确认证失效、封禁或额度耗尽就移入 `限流账号` 人工审核分组，临时限流或网络失败累计到阈值后也移入人工审核分组，不再自动软删除账号记录。
 
+`限流账号` 是人工审核隔离组。账号进入该组后应只保留这一组，不再同时挂 `GPTFREE` 或其他业务组；导入工具也不会给已在 `限流账号` 的账号补默认业务组。
+
 历史重复 OAuth 账号用单独工具处理，默认只审计，不直接改库：
 
 ```powershell

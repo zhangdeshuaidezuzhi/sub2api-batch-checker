@@ -113,6 +113,22 @@ def test_generate_sql_links_default_group_and_group_proxy() -> None:
     assert "proxy_id" in sql
 
 
+def test_generate_sql_does_not_add_default_group_to_review_group_accounts() -> None:
+    sql = importer.sqlgen.build_insert_sql(
+        {
+            "name": "limited@example.com",
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": {"access_token": "dummy"},
+        },
+        "unit-test",
+        1,
+    )
+
+    assert "review_g.name = '限流账号'" in sql
+    assert "review_ag.account_id = ta.id" in sql
+
+
 def test_generate_sql_respects_explicit_group_name() -> None:
     sql = importer.sqlgen.build_insert_sql(
         {
