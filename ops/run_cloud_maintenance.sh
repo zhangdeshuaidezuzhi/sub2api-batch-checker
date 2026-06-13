@@ -10,6 +10,7 @@ exec flock -n /tmp/sub2api-cloud-maintenance.lock \
     --min-hard-failures 2 \
     --usage-pause-days 7 \
     --temporary-rate-pause-minutes 20 \
+    --review-group-name 限流账号 \
     --probe-active \
     --probe-limit 50 \
     --recover-probe-limit 20 \

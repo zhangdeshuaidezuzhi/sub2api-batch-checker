@@ -13,6 +13,8 @@ CODEX_USER_AGENT = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (c
 CODEX_ORIGINATOR = "codex-tui"
 DEFAULT_TEMPORARY_USAGE_LIMIT_MAX_SECONDS = 12 * 60 * 60
 DEFAULT_RECOVER_DELETE_AFTER_FAILURES = 3
+DEFAULT_REVIEW_GROUP_NAME = "限流账号"
+QUARANTINE_ACTION = "quarantine_review_group"
 
 AUTH_INVALID_PATTERNS = [
     "invalidated oauth token",
@@ -324,6 +326,77 @@ ALTER TABLE IF EXISTS ops_account_active_probe_state
         )
 
 
+def ensure_review_group(apply, review_group_name):
+    if not apply:
+        return
+    name_sql = sql_string(review_group_name)
+    sql = """
+BEGIN;
+INSERT INTO groups (
+  name,
+  description,
+  platform,
+  is_exclusive,
+  status,
+  supported_model_scopes,
+  allow_messages_dispatch,
+  sort_order,
+  created_at,
+  updated_at
+)
+SELECT
+  {name},
+  'Cloud maintenance manual review quarantine',
+  'openai',
+  true,
+  'active',
+  '[]'::jsonb,
+  false,
+  0,
+  now(),
+  now()
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM groups
+  WHERE name = {name}
+    AND deleted_at IS NULL
+);
+UPDATE groups
+SET platform = 'openai',
+    is_exclusive = true,
+    status = 'active',
+    supported_model_scopes = '[]'::jsonb,
+    allow_messages_dispatch = false,
+    updated_at = now()
+WHERE id = (
+  SELECT id
+  FROM groups
+  WHERE name = {name}
+    AND deleted_at IS NULL
+  ORDER BY id
+  LIMIT 1
+);
+COMMIT;
+""".format(name=name_sql)
+    run_sql(sql)
+
+
+def review_group_filter_sql(account_alias, review_group_name, negate=False):
+    exists_sql = """
+EXISTS (
+  SELECT 1
+  FROM account_groups review_ag
+  JOIN groups review_g ON review_g.id = review_ag.group_id
+  WHERE review_ag.account_id = {account_alias}.id
+    AND review_g.name = {group_name}
+    AND review_g.deleted_at IS NULL
+)
+""".format(account_alias=account_alias, group_name=sql_string(review_group_name))
+    if negate:
+        return "NOT " + exists_sql
+    return exists_sql
+
+
 def load_error_evidence(lookback_hours):
     sql = f"""
 COPY (
@@ -516,12 +589,12 @@ def dictionary_category(row, temporary_usage_limit_max_seconds):
     if matches(message, IGNORED_PATTERNS):
         return "ignore_request_or_system"
     if matches(message, BANNED_PATTERNS):
-        return "soft_delete_banned_or_forbidden"
+        return "quarantine_banned_or_forbidden"
     if matches(message, AUTH_INVALID_PATTERNS) or status_int(http_status) == 401:
         return "pause_or_delete_auth_invalid"
     limit_signal = classify_limit_signal(message, http_status, temporary_usage_limit_max_seconds)
     if limit_signal == "usage_quota_exhausted":
-        return "soft_delete_usage_quota_or_long_reset"
+        return "quarantine_usage_quota_or_long_reset"
     if limit_signal == "temporary_rate_limit":
         return "pause_temporary_429_then_probe"
     if limit_signal == "temporary_usage_limit":
@@ -660,7 +733,7 @@ def merge_evidence(*sources):
     return merged
 
 
-def load_accounts():
+def load_accounts(review_group_name):
     # Cloud maintenance only owns OAuth/token-json accounts. API-key upstreams are
     # managed by the separate key workflow to avoid deleting good keys on transient
     # upstream/network failures.
@@ -687,6 +760,7 @@ COPY (
          coalesce(a.temp_unschedulable_until::text, '') AS temp_unschedulable_until,
          coalesce((a.temp_unschedulable_until > now())::text, 'false') AS temp_pause_active,
          coalesce(a.temp_unschedulable_reason, '') AS temp_unschedulable_reason,
+         coalesce(({review_group_condition})::text, 'false') AS in_review_group,
 {state_columns}
          coalesce(a.updated_at::text, '') AS updated_at
   FROM accounts a
@@ -694,7 +768,11 @@ COPY (
   WHERE a.deleted_at IS NULL
     AND a.type = 'oauth'
 ) TO STDOUT WITH CSV HEADER;
-""".format(state_columns=state_columns, state_join=state_join)
+""".format(
+        state_columns=state_columns,
+        state_join=state_join,
+        review_group_condition=review_group_filter_sql("a", review_group_name),
+    )
     out = run_sql(sql)
     import csv
     from io import StringIO
@@ -830,7 +908,7 @@ COPY (
     return list(csv.DictReader(StringIO(out)))
 
 
-def load_expired_temporary_pause_candidates(limit):
+def load_expired_temporary_pause_candidates(limit, review_group_name):
     if int(limit) <= 0:
         return []
     text_expr = "coalesce(a.temp_unschedulable_reason, '') || ' ' || coalesce(a.error_message, '')"
@@ -865,6 +943,7 @@ def load_expired_temporary_pause_candidates(limit):
 """
     else:
         historical_column = "'0' AS historical_recovery_probe_failures"
+    review_group_condition = review_group_filter_sql("a", review_group_name, negate=True)
     sql = f"""
 COPY (
   SELECT a.id,
@@ -894,6 +973,7 @@ COPY (
     AND a.temp_unschedulable_until <= now()
     AND coalesce(a.temp_unschedulable_reason, '') LIKE 'cloud-maintenance:%'
     AND {temporary_limit_sql_condition(text_expr)}
+    AND {review_group_condition}
   ORDER BY a.temp_unschedulable_until ASC, a.id ASC
   LIMIT {int(limit)}
 ) TO STDOUT WITH CSV HEADER;
@@ -905,7 +985,7 @@ COPY (
     return list(csv.DictReader(StringIO(out)))
 
 
-def load_legacy_unschedulable_candidates(limit, min_interval_hours):
+def load_legacy_unschedulable_candidates(limit, min_interval_hours, review_group_name):
     if int(limit) <= 0:
         return []
     state_table_exists = run_sql("SELECT to_regclass('public.ops_account_active_probe_state');").strip()
@@ -929,6 +1009,7 @@ def load_legacy_unschedulable_candidates(limit, min_interval_hours):
 """
         state_filter = ""
         state_order = ""
+    review_group_condition = review_group_filter_sql("a", review_group_name, negate=True)
     sql = f"""
 COPY (
   SELECT a.id,
@@ -955,6 +1036,7 @@ COPY (
     AND a.temp_unschedulable_until IS NULL
     AND coalesce(a.temp_unschedulable_reason, '') = ''
     {state_filter}
+    AND {review_group_condition}
   ORDER BY {state_order} coalesce(a.last_used_at, a.updated_at, a.created_at) ASC NULLS FIRST, a.id ASC
   LIMIT {int(limit)}
 ) TO STDOUT WITH CSV HEADER;
@@ -966,7 +1048,7 @@ COPY (
     return list(csv.DictReader(StringIO(out)))
 
 
-def load_stale_marked_unschedulable_candidates(limit, min_interval_hours):
+def load_stale_marked_unschedulable_candidates(limit, min_interval_hours, review_group_name):
     if int(limit) <= 0:
         return []
     state_table_exists = run_sql("SELECT to_regclass('public.ops_account_active_probe_state');").strip()
@@ -990,6 +1072,7 @@ def load_stale_marked_unschedulable_candidates(limit, min_interval_hours):
 """
         state_filter = ""
         state_order = ""
+    review_group_condition = review_group_filter_sql("a", review_group_name, negate=True)
     sql = f"""
 COPY (
   SELECT a.id,
@@ -1016,6 +1099,7 @@ COPY (
     AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at <= now())
     AND coalesce(a.temp_unschedulable_reason, '') LIKE 'cloud-maintenance:%'
     {state_filter}
+    AND {review_group_condition}
   ORDER BY {state_order} coalesce(a.last_used_at, a.updated_at, a.created_at) ASC NULLS FIRST, a.id ASC
   LIMIT {int(limit)}
 ) TO STDOUT WITH CSV HEADER;
@@ -1096,6 +1180,8 @@ def has_newer_ok_probe(account, decision):
 def should_skip_decision(account, decision):
     if decision is None:
         return True
+    if is_truthy(account.get("in_review_group", "")):
+        return True
     if (
         decision.action == "pause_usage_limited"
         and is_temporary_rate_limit_reason(decision.reason)
@@ -1106,9 +1192,46 @@ def should_skip_decision(account, decision):
         return False
     if account.get("status") not in ("active", ""):
         return True
-    if decision.action == "soft_delete":
+    if decision.action in ("soft_delete", QUARANTINE_ACTION):
         return False
     return should_skip_account(account)
+
+
+def dedupe_decisions(decisions):
+    merged = {}
+    ordered = []
+    for decision in decisions:
+        key = decision.account_id
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = decision
+            ordered.append(decision)
+            continue
+        if existing.action == QUARANTINE_ACTION or decision.action == QUARANTINE_ACTION:
+            if existing.action != QUARANTINE_ACTION:
+                existing.action = QUARANTINE_ACTION
+                existing.reason = decision.reason
+                existing.last_seen_at = decision.last_seen_at
+                existing.sample = decision.sample
+                existing.reset_sql = decision.reset_sql
+                existing.reset_source = decision.reset_source
+            elif decision.action == QUARANTINE_ACTION and decision.reason not in existing.reason.split("+"):
+                existing.reason = existing.reason + "+" + decision.reason
+                if not existing.sample:
+                    existing.sample = decision.sample
+                if str(decision.last_seen_at or "") > str(existing.last_seen_at or ""):
+                    existing.last_seen_at = decision.last_seen_at
+            existing.evidence_count += decision.evidence_count
+            continue
+        if existing.action == "pause_usage_limited" and decision.action == "pause_auth_invalid":
+            continue
+        if existing.action == "pause_auth_invalid" and decision.action == "pause_usage_limited":
+            merged[key] = decision
+            index = ordered.index(existing)
+            ordered[index] = decision
+            continue
+        existing.evidence_count += decision.evidence_count
+    return ordered
 
 
 def decode_jwt_claims(token):
@@ -1356,7 +1479,7 @@ def run_active_probes(args, now_iso):
             decisions.append(
                 Decision(
                     result["account_id"],
-                    "soft_delete",
+                    QUARANTINE_ACTION,
                     "active_probe_usage_quota_exhausted",
                     max(1, probe_failures),
                     now_iso,
@@ -1367,7 +1490,7 @@ def run_active_probes(args, now_iso):
             decisions.append(
                 Decision(
                     result["account_id"],
-                    "soft_delete",
+                    QUARANTINE_ACTION,
                     "active_probe_banned_or_forbidden",
                     max(1, probe_failures),
                     now_iso,
@@ -1379,7 +1502,7 @@ def run_active_probes(args, now_iso):
                 decisions.append(
                     Decision(
                         result["account_id"],
-                        "soft_delete",
+                        QUARANTINE_ACTION,
                         "active_probe_failed_{0}_times".format(probe_failures),
                         probe_failures,
                         now_iso,
@@ -1404,7 +1527,7 @@ def run_active_probes(args, now_iso):
             decisions.append(
                 Decision(
                     result["account_id"],
-                    "soft_delete",
+                    QUARANTINE_ACTION,
                     "active_probe_auth_invalid_probe_only",
                     max(1, probe_failures),
                     now_iso,
@@ -1416,7 +1539,7 @@ def run_active_probes(args, now_iso):
                 decisions.append(
                     Decision(
                         result["account_id"],
-                        "soft_delete",
+                        QUARANTINE_ACTION,
                         "active_probe_failed_{0}_times".format(probe_failures),
                         probe_failures,
                         now_iso,
@@ -1458,7 +1581,7 @@ def run_unschedulable_probe_batch(candidates, args, now_iso, reason_prefix):
             decisions.append(
                 Decision(
                     result["account_id"],
-                    "soft_delete",
+                    QUARANTINE_ACTION,
                     reason_prefix + "_usage_quota_exhausted",
                     max(1, probe_failures),
                     now_iso,
@@ -1469,7 +1592,7 @@ def run_unschedulable_probe_batch(candidates, args, now_iso, reason_prefix):
             decisions.append(
                 Decision(
                     result["account_id"],
-                    "soft_delete",
+                    QUARANTINE_ACTION,
                     reason_prefix + "_banned_or_forbidden",
                     max(1, probe_failures),
                     now_iso,
@@ -1481,7 +1604,7 @@ def run_unschedulable_probe_batch(candidates, args, now_iso, reason_prefix):
                 decisions.append(
                     Decision(
                         result["account_id"],
-                        "soft_delete",
+                        QUARANTINE_ACTION,
                         reason_prefix + "_failed_{0}_times".format(probe_failures),
                         probe_failures,
                         now_iso,
@@ -1506,7 +1629,7 @@ def run_unschedulable_probe_batch(candidates, args, now_iso, reason_prefix):
             decisions.append(
                 Decision(
                     result["account_id"],
-                    "soft_delete",
+                    QUARANTINE_ACTION,
                     reason_prefix + "_auth_invalid_probe_only",
                     max(1, probe_failures),
                     now_iso,
@@ -1518,7 +1641,7 @@ def run_unschedulable_probe_batch(candidates, args, now_iso, reason_prefix):
                 decisions.append(
                     Decision(
                         result["account_id"],
-                        "soft_delete",
+                        QUARANTINE_ACTION,
                         reason_prefix + "_failed_{0}_times".format(probe_failures),
                         probe_failures,
                         now_iso,
@@ -1533,6 +1656,7 @@ def run_legacy_unschedulable_probes(args, now_iso):
     candidates = load_legacy_unschedulable_candidates(
         args.legacy_unschedulable_probe_limit,
         args.probe_min_interval_hours,
+        args.review_group_name,
     )
     if not args.apply:
         return [], [], len(candidates), 0
@@ -1544,6 +1668,7 @@ def run_stale_marked_unschedulable_probes(args, now_iso):
     candidates = load_stale_marked_unschedulable_candidates(
         args.stale_marked_unschedulable_probe_limit,
         args.probe_min_interval_hours,
+        args.review_group_name,
     )
     if not args.apply:
         return [], [], len(candidates), 0
@@ -1645,11 +1770,11 @@ def classify(account_id, rows, now_iso, min_hard_failures, temporary_usage_limit
 
     last_seen_at = newest.get("last_seen_at", now_iso)
     if total_banned >= 1:
-        return Decision(account_id, "soft_delete", "banned_or_forbidden", total_banned, banned_last_seen_at or last_seen_at, banned_sample or sample)
+        return Decision(account_id, QUARANTINE_ACTION, "banned_or_forbidden", total_banned, banned_last_seen_at or last_seen_at, banned_sample or sample)
     if total_usage_quota >= 1:
         return Decision(
             account_id,
-            "soft_delete",
+            QUARANTINE_ACTION,
             "usage_quota_exhausted",
             total_usage_quota,
             usage_quota_last_seen_at or last_seen_at,
@@ -1658,7 +1783,7 @@ def classify(account_id, rows, now_iso, min_hard_failures, temporary_usage_limit
     if total_long_rate_pause >= 1:
         return Decision(
             account_id,
-            "soft_delete",
+            QUARANTINE_ACTION,
             "long_rate_limit_pause",
             total_long_rate_pause,
             long_rate_last_seen_at or last_seen_at,
@@ -1678,17 +1803,17 @@ def classify(account_id, rows, now_iso, min_hard_failures, temporary_usage_limit
     if total_auth > 0 and auth_evidence_is_superseded(rows, auth_last_seen_at):
         return None
     if total_error_status_auth >= 1:
-        return Decision(account_id, "soft_delete", "error_status_auth_invalid", total_error_status_auth, auth_last_seen_at or last_seen_at, auth_sample or sample)
+        return Decision(account_id, QUARANTINE_ACTION, "error_status_auth_invalid", total_error_status_auth, auth_last_seen_at or last_seen_at, auth_sample or sample)
     if total_maintenance_auth >= 1:
-        return Decision(account_id, "soft_delete", "maintenance_auth_invalid_probe", total_maintenance_auth, auth_last_seen_at or last_seen_at, auth_sample or sample)
+        return Decision(account_id, QUARANTINE_ACTION, "maintenance_auth_invalid_probe", total_maintenance_auth, auth_last_seen_at or last_seen_at, auth_sample or sample)
     if total_auth >= min_hard_failures:
-        return Decision(account_id, "soft_delete", "repeated_auth_invalid", total_auth, auth_last_seen_at or last_seen_at, auth_sample or sample)
+        return Decision(account_id, QUARANTINE_ACTION, "repeated_auth_invalid", total_auth, auth_last_seen_at or last_seen_at, auth_sample or sample)
     if total_auth > 0:
         return Decision(account_id, "pause_auth_invalid", "auth_invalid_single_or_low_count", total_auth, auth_last_seen_at or last_seen_at, auth_sample or sample)
     return None
 
 
-def apply_decision(decision, usage_pause_days, temporary_rate_pause_minutes):
+def apply_decision(decision, usage_pause_days, temporary_rate_pause_minutes, review_group_name):
     reason = f"cloud-maintenance:{decision.reason}; evidence={decision.evidence_count}; last_seen={decision.last_seen_at}"
     if is_temporary_rate_limit_reason(decision.reason):
         fallback_reset_sql = "now() + interval '{0} minutes'".format(max(1, int(temporary_rate_pause_minutes)))
@@ -1703,18 +1828,49 @@ def apply_decision(decision, usage_pause_days, temporary_rate_pause_minutes):
 INSERT INTO ops_account_maintenance_audits (account_id, action, reason, evidence_count, last_seen_at, sample_message, applied)
 VALUES ({decision.account_id}, {sql_string(decision.action)}, {sql_string(decision.reason)}, {decision.evidence_count}, {sql_string(decision.last_seen_at)}::timestamptz, {sql_string(decision.sample)}, true);
 """
-    if decision.action == "soft_delete":
+    if decision.action in ("soft_delete", QUARANTINE_ACTION):
         sql = f"""
 BEGIN;
-UPDATE accounts
-SET schedulable = false,
-    status = 'disabled',
-    deleted_at = now(),
-    error_message = {sql_string(reason)},
-    temp_unschedulable_reason = {sql_string(reason)},
-    updated_at = now()
-WHERE id = {decision.account_id}
-  AND deleted_at IS NULL;
+WITH target_group AS (
+  SELECT id
+  FROM groups
+  WHERE name = {sql_string(review_group_name)}
+    AND deleted_at IS NULL
+    AND status = 'active'
+  ORDER BY id
+  LIMIT 1
+),
+updated_account AS (
+  UPDATE accounts
+  SET schedulable = false,
+      status = 'active',
+      deleted_at = NULL,
+      rate_limit_reset_at = NULL,
+      temp_unschedulable_until = NULL,
+      error_message = {sql_string(reason)},
+      temp_unschedulable_reason = {sql_string(reason)},
+      updated_at = now()
+  WHERE id = {decision.account_id}
+    AND deleted_at IS NULL
+  RETURNING id
+),
+removed_old_groups AS (
+  DELETE FROM account_groups ag
+  USING updated_account ua, target_group tg
+  WHERE ag.account_id = ua.id
+    AND ag.group_id <> tg.id
+  RETURNING 1
+),
+review_group_link AS (
+  INSERT INTO account_groups (account_id, group_id, priority, created_at)
+  SELECT ua.id, tg.id, 100, now()
+  FROM updated_account ua
+  CROSS JOIN target_group tg
+  ON CONFLICT (account_id, group_id) DO UPDATE
+  SET priority = EXCLUDED.priority
+  RETURNING 1
+)
+SELECT count(*) FROM review_group_link;
 {audit_sql}
 COMMIT;
 """
@@ -1801,7 +1957,7 @@ COMMIT;
 
 def run_expired_pause_recovery(args, now_iso):
     ensure_probe_state_table(args.apply)
-    candidates = load_expired_temporary_pause_candidates(args.recover_probe_limit)
+    candidates = load_expired_temporary_pause_candidates(args.recover_probe_limit, args.review_group_name)
     if not args.apply:
         return [], [], len(candidates), 0
 
@@ -1830,7 +1986,7 @@ def run_expired_pause_recovery(args, now_iso):
             decisions.append(
                 Decision(
                     result["account_id"],
-                    "soft_delete",
+                    QUARANTINE_ACTION,
                     "expired_pause_usage_quota_exhausted",
                     1,
                     now_iso,
@@ -1842,7 +1998,7 @@ def run_expired_pause_recovery(args, now_iso):
                 decisions.append(
                     Decision(
                         result["account_id"],
-                        "soft_delete",
+                        QUARANTINE_ACTION,
                         "expired_pause_recovery_failed_{0}_times".format(recovery_failures),
                         recovery_failures,
                         now_iso,
@@ -1867,7 +2023,7 @@ def run_expired_pause_recovery(args, now_iso):
             decisions.append(
                 Decision(
                     result["account_id"],
-                    "soft_delete",
+                    QUARANTINE_ACTION,
                     "expired_pause_banned_or_forbidden",
                     1,
                     now_iso,
@@ -1879,7 +2035,7 @@ def run_expired_pause_recovery(args, now_iso):
                 decisions.append(
                     Decision(
                         result["account_id"],
-                        "soft_delete",
+                        QUARANTINE_ACTION,
                         "expired_pause_recovery_failed_{0}_times".format(recovery_failures),
                         recovery_failures,
                         now_iso,
@@ -1902,7 +2058,7 @@ def run_expired_pause_recovery(args, now_iso):
                 decisions.append(
                     Decision(
                         result["account_id"],
-                        "soft_delete",
+                        QUARANTINE_ACTION,
                         "expired_pause_recovery_failed_{0}_times".format(recovery_failures),
                         recovery_failures,
                         now_iso,
@@ -1937,7 +2093,8 @@ def main():
     parser.add_argument("--recover-probe-limit", type=int, default=10, help="Maximum expired temporary 429 pauses to probe this run.")
     parser.add_argument("--legacy-unschedulable-probe-limit", type=int, default=0, help="Maximum legacy unmarked unschedulable OAuth accounts to probe this run. 0 disables.")
     parser.add_argument("--stale-marked-unschedulable-probe-limit", type=int, default=0, help="Maximum cloud-maintenance marked unschedulable OAuth accounts without reset time to probe this run. 0 disables.")
-    parser.add_argument("--recover-delete-after-failures", type=int, default=DEFAULT_RECOVER_DELETE_AFTER_FAILURES, help="Soft-delete an expired temporary pause after this many consecutive recovery probe failures. 0 disables.")
+    parser.add_argument("--recover-delete-after-failures", type=int, default=DEFAULT_RECOVER_DELETE_AFTER_FAILURES, help="Quarantine an expired temporary pause after this many consecutive recovery probe failures. 0 disables.")
+    parser.add_argument("--review-group-name", default=DEFAULT_REVIEW_GROUP_NAME, help="Manual review group for unusable accounts.")
     parser.add_argument("--probe-min-interval-hours", type=int, default=24)
     parser.add_argument("--probe-timeout", type=float, default=20.0)
     parser.add_argument("--probe-model", default="gpt-5.5")
@@ -1962,7 +2119,8 @@ def main():
         return
 
     ensure_audit_table(args.apply)
-    accounts = load_accounts()
+    ensure_review_group(args.apply, args.review_group_name)
+    accounts = load_accounts(args.review_group_name)
     evidence = merge_evidence(
         load_error_evidence(args.lookback_hours),
         load_system_log_limit_evidence(args.lookback_hours),
@@ -1999,11 +2157,12 @@ def main():
     stale_decisions, stale_results, stale_candidate_count, stale_recovered_count = run_stale_marked_unschedulable_probes(args, now_iso)
     decisions.extend(stale_decisions)
     recovered_count += stale_recovered_count
+    decisions = dedupe_decisions(decisions)
 
     if args.apply:
         ensure_audit_table(True)
         for decision in decisions:
-            apply_decision(decision, args.usage_pause_days, args.temporary_rate_pause_minutes)
+            apply_decision(decision, args.usage_pause_days, args.temporary_rate_pause_minutes, args.review_group_name)
 
     payload = {
         "mode": "apply" if args.apply else "dry-run",
@@ -2023,6 +2182,7 @@ def main():
         "stale_marked_unschedulable_candidate_count": stale_candidate_count,
         "stale_marked_unschedulable_result_count": len(stale_results),
         "recover_delete_after_failures": args.recover_delete_after_failures,
+        "review_group_name": args.review_group_name,
         "shortened_temporary_pause_count": shortened_temporary_pause_count,
         "decision_count": len(decisions),
         "recovered_count": recovered_count,

@@ -23,6 +23,7 @@ def _args(threshold=3):
         probe_timeout=20,
         temporary_usage_limit_max_seconds=12 * 60 * 60,
         recover_delete_after_failures=threshold,
+        review_group_name=cloud.DEFAULT_REVIEW_GROUP_NAME,
     )
 
 
@@ -54,7 +55,7 @@ def _result(result_name):
 def test_recovery_probe_failure_below_threshold_pauses_again(monkeypatch) -> None:
     recorded = []
     monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
-    monkeypatch.setattr(cloud, "load_expired_temporary_pause_candidates", lambda limit: [_row(1)])
+    monkeypatch.setattr(cloud, "load_expired_temporary_pause_candidates", lambda limit, review_group_name: [_row(1)])
     monkeypatch.setattr(cloud, "active_probe_account", lambda *args: _result("temporary_rate_limit"))
     monkeypatch.setattr(cloud, "record_probe_state", lambda result, apply, count=None: recorded.append(count))
 
@@ -70,10 +71,10 @@ def test_recovery_probe_failure_below_threshold_pauses_again(monkeypatch) -> Non
     assert decisions[0].evidence_count == 2
 
 
-def test_recovery_probe_failure_at_threshold_soft_deletes(monkeypatch) -> None:
+def test_recovery_probe_failure_at_threshold_quarantines(monkeypatch) -> None:
     recorded = []
     monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
-    monkeypatch.setattr(cloud, "load_expired_temporary_pause_candidates", lambda limit: [_row(2)])
+    monkeypatch.setattr(cloud, "load_expired_temporary_pause_candidates", lambda limit, review_group_name: [_row(2)])
     monkeypatch.setattr(cloud, "active_probe_account", lambda *args: _result("temporary_rate_limit"))
     monkeypatch.setattr(cloud, "record_probe_state", lambda result, apply, count=None: recorded.append(count))
 
@@ -82,7 +83,7 @@ def test_recovery_probe_failure_at_threshold_soft_deletes(monkeypatch) -> None:
     assert recovered_count == 0
     assert recorded == [3]
     assert len(decisions) == 1
-    assert decisions[0].action == "soft_delete"
+    assert decisions[0].action == cloud.QUARANTINE_ACTION
     assert decisions[0].reason == "expired_pause_recovery_failed_3_times"
     assert decisions[0].evidence_count == 3
 
@@ -91,7 +92,7 @@ def test_recovery_probe_ok_resets_failure_count_and_recovers(monkeypatch) -> Non
     recorded = []
     recovered = []
     monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
-    monkeypatch.setattr(cloud, "load_expired_temporary_pause_candidates", lambda limit: [_row(2)])
+    monkeypatch.setattr(cloud, "load_expired_temporary_pause_candidates", lambda limit, review_group_name: [_row(2)])
     monkeypatch.setattr(cloud, "active_probe_account", lambda *args: _result("ok"))
     monkeypatch.setattr(cloud, "record_probe_state", lambda result, apply, count=None: recorded.append(count))
     monkeypatch.setattr(cloud, "apply_recovery", lambda result, now_iso: recovered.append(result["account_id"]))
@@ -122,7 +123,7 @@ def test_active_probe_failure_below_threshold_pauses_and_counts(monkeypatch) -> 
     assert decisions[0].evidence_count == 2
 
 
-def test_active_probe_failure_at_threshold_soft_deletes(monkeypatch) -> None:
+def test_active_probe_failure_at_threshold_quarantines(monkeypatch) -> None:
     recorded = []
     monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
     monkeypatch.setattr(cloud, "load_active_probe_candidates", lambda limit, interval: [_active_row(2)])
@@ -133,7 +134,7 @@ def test_active_probe_failure_at_threshold_soft_deletes(monkeypatch) -> None:
 
     assert recorded == [3]
     assert len(decisions) == 1
-    assert decisions[0].action == "soft_delete"
+    assert decisions[0].action == cloud.QUARANTINE_ACTION
     assert decisions[0].reason == "active_probe_failed_3_times"
     assert decisions[0].evidence_count == 3
 
@@ -152,7 +153,7 @@ def test_active_probe_ok_resets_failure_count(monkeypatch) -> None:
     assert recorded == [0]
 
 
-def test_active_probe_hard_quota_soft_deletes_immediately(monkeypatch) -> None:
+def test_active_probe_hard_quota_quarantines_immediately(monkeypatch) -> None:
     recorded = []
     monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
     monkeypatch.setattr(cloud, "load_active_probe_candidates", lambda limit, interval: [_active_row(0)])
@@ -163,12 +164,12 @@ def test_active_probe_hard_quota_soft_deletes_immediately(monkeypatch) -> None:
 
     assert recorded == [1]
     assert len(decisions) == 1
-    assert decisions[0].action == "soft_delete"
+    assert decisions[0].action == cloud.QUARANTINE_ACTION
     assert decisions[0].reason == "active_probe_usage_quota_exhausted"
     assert decisions[0].evidence_count == 1
 
 
-def test_active_probe_auth_invalid_soft_deletes_immediately(monkeypatch) -> None:
+def test_active_probe_auth_invalid_quarantines_immediately(monkeypatch) -> None:
     recorded = []
     monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
     monkeypatch.setattr(cloud, "load_active_probe_candidates", lambda limit, interval: [_active_row(0)])
@@ -179,12 +180,12 @@ def test_active_probe_auth_invalid_soft_deletes_immediately(monkeypatch) -> None
 
     assert recorded == [1]
     assert len(decisions) == 1
-    assert decisions[0].action == "soft_delete"
+    assert decisions[0].action == cloud.QUARANTINE_ACTION
     assert decisions[0].reason == "active_probe_auth_invalid_probe_only"
     assert decisions[0].evidence_count == 1
 
 
-def test_maintenance_auth_evidence_soft_deletes() -> None:
+def test_maintenance_auth_evidence_quarantines() -> None:
     decision = cloud.classify(
         101,
         [
@@ -204,7 +205,7 @@ def test_maintenance_auth_evidence_soft_deletes() -> None:
     )
 
     assert decision is not None
-    assert decision.action == "soft_delete"
+    assert decision.action == cloud.QUARANTINE_ACTION
     assert decision.reason == "maintenance_auth_invalid_probe"
     assert decision.evidence_count == 1
 
@@ -220,7 +221,7 @@ def test_load_accounts_scopes_maintenance_to_oauth(monkeypatch) -> None:
 
     monkeypatch.setattr(cloud, "run_sql", fake_run_sql)
 
-    assert cloud.load_accounts() == {}
+    assert cloud.load_accounts(cloud.DEFAULT_REVIEW_GROUP_NAME) == {}
     assert "a.type = 'oauth'" in sql_calls[-1]
 
 
@@ -267,9 +268,10 @@ def test_legacy_unschedulable_candidates_are_oauth_unmarked(monkeypatch) -> None
 
     monkeypatch.setattr(cloud, "run_sql", fake_run_sql)
 
-    assert cloud.load_legacy_unschedulable_candidates(5, 1) == []
+    assert cloud.load_legacy_unschedulable_candidates(5, 1, cloud.DEFAULT_REVIEW_GROUP_NAME) == []
     query = sql_calls[-1]
     assert "a.type = 'oauth'" in query
+    assert "NOT " in query
     assert "a.schedulable = false" in query
     assert "a.rate_limit_reset_at IS NULL" in query
     assert "a.temp_unschedulable_until IS NULL" in query
@@ -287,9 +289,10 @@ def test_stale_marked_unschedulable_candidates_are_oauth_cloud_maintenance(monke
 
     monkeypatch.setattr(cloud, "run_sql", fake_run_sql)
 
-    assert cloud.load_stale_marked_unschedulable_candidates(5, 1) == []
+    assert cloud.load_stale_marked_unschedulable_candidates(5, 1, cloud.DEFAULT_REVIEW_GROUP_NAME) == []
     query = sql_calls[-1]
     assert "a.type = 'oauth'" in query
+    assert "NOT " in query
     assert "a.schedulable = false" in query
     assert "a.temp_unschedulable_until IS NULL" in query
     assert "(a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at <= now())" in query
@@ -300,7 +303,7 @@ def test_legacy_unschedulable_probe_ok_recovers(monkeypatch) -> None:
     recorded = []
     recovered = []
     monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
-    monkeypatch.setattr(cloud, "load_legacy_unschedulable_candidates", lambda limit, interval: [_row(2)])
+    monkeypatch.setattr(cloud, "load_legacy_unschedulable_candidates", lambda limit, interval, review_group_name: [_row(2)])
     monkeypatch.setattr(cloud, "active_probe_account", lambda *args: _result("ok"))
     monkeypatch.setattr(cloud, "record_probe_state", lambda result, apply, count=None: recorded.append(count))
     monkeypatch.setattr(cloud, "apply_recovery", lambda result, now_iso: recovered.append(result["account_id"]))
@@ -317,7 +320,7 @@ def test_legacy_unschedulable_probe_ok_recovers(monkeypatch) -> None:
 def test_stale_marked_unschedulable_probe_auth_invalid_deletes(monkeypatch) -> None:
     recorded = []
     monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
-    monkeypatch.setattr(cloud, "load_stale_marked_unschedulable_candidates", lambda limit, interval: [_row(0)])
+    monkeypatch.setattr(cloud, "load_stale_marked_unschedulable_candidates", lambda limit, interval, review_group_name: [_row(0)])
     monkeypatch.setattr(cloud, "active_probe_account", lambda *args: _result("auth_invalid_probe_only"))
     monkeypatch.setattr(cloud, "record_probe_state", lambda result, apply, count=None: recorded.append(count))
 
@@ -327,14 +330,14 @@ def test_stale_marked_unschedulable_probe_auth_invalid_deletes(monkeypatch) -> N
     assert recovered_count == 0
     assert recorded == [1]
     assert len(decisions) == 1
-    assert decisions[0].action == "soft_delete"
+    assert decisions[0].action == cloud.QUARANTINE_ACTION
     assert decisions[0].reason == "stale_marked_unschedulable_auth_invalid_probe_only"
 
 
 def test_legacy_unschedulable_probe_failure_at_threshold_deletes(monkeypatch) -> None:
     recorded = []
     monkeypatch.setattr(cloud, "ensure_probe_state_table", lambda apply: None)
-    monkeypatch.setattr(cloud, "load_legacy_unschedulable_candidates", lambda limit, interval: [_row(2)])
+    monkeypatch.setattr(cloud, "load_legacy_unschedulable_candidates", lambda limit, interval, review_group_name: [_row(2)])
     monkeypatch.setattr(cloud, "active_probe_account", lambda *args: _result("temporary_rate_limit"))
     monkeypatch.setattr(cloud, "record_probe_state", lambda result, apply, count=None: recorded.append(count))
 
@@ -344,5 +347,5 @@ def test_legacy_unschedulable_probe_failure_at_threshold_deletes(monkeypatch) ->
     assert recovered_count == 0
     assert recorded == [3]
     assert len(decisions) == 1
-    assert decisions[0].action == "soft_delete"
+    assert decisions[0].action == cloud.QUARANTINE_ACTION
     assert decisions[0].reason == "legacy_unschedulable_failed_3_times"
