@@ -29,8 +29,7 @@ def sql_list(values):
     return ", ".join(sqlgen.sql_string(value) for value in values) if values else "NULL"
 
 
-def build_verify_sql(names):
-    names_sql = sql_list(names)
+def build_verify_sql(import_tag):
     return """
 SELECT
   a.id::text || '|' ||
@@ -44,11 +43,11 @@ LEFT JOIN proxies p ON p.id = a.proxy_id
 LEFT JOIN account_groups ag ON ag.account_id = a.id
 LEFT JOIN groups g ON g.id = ag.group_id
 WHERE a.deleted_at IS NULL
-  AND a.name IN ({0})
+  AND a.extra ->> 'cloud_import_tag' = {0}
 GROUP BY a.id, a.name, a.status, a.schedulable, p.name
 ORDER BY a.id;
 """.format(
-        names_sql
+        sqlgen.sql_string(import_tag)
     )
 
 
@@ -192,7 +191,6 @@ def import_bundle(args):
     bundle_path = args.bundle.resolve()
     import_tag = safe_tag(args.import_tag or "{0}_{1}".format(bundle_path.stem, datetime.now().strftime("%Y%m%d_%H%M%S")))
     accounts, local_sql, cleanup_local = make_local_sql(bundle_path, import_tag, args.keep_local_sql, args.output_sql)
-    account_names = [sqlgen.account_name(account, index) for index, account in enumerate(accounts, start=1)]
     remote_sql = "{0}/{1}.sql".format(args.remote_sql_dir.rstrip("/"), import_tag)
 
     print("bundle={0}".format(bundle_path))
@@ -225,7 +223,7 @@ def import_bundle(args):
         for line in parsed["other"]:
             print("notice={0}".format(line))
 
-        verify_rows = parse_verify_output(run_psql_stdin(build_verify_sql(account_names), args))
+        verify_rows = parse_verify_output(run_psql_stdin(build_verify_sql(import_tag), args))
         print("verified={0}".format(len(verify_rows)))
         for row in verify_rows:
             if "raw" in row:

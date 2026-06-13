@@ -270,6 +270,7 @@ def convert_record(record: dict[str, Any], require_id_token: bool = True) -> tup
             "source_file": clean_str(record.get("_source_file")),
             "source_batch": clean_str(record.get("source_batch")),
             "phone": clean_str(record.get("phone")),
+            "access_only": bool(access_token and not id_token),
             "cpa_ready": bool(record.get("cpa_ready")),
             "cpa_missing_reason": clean_str(record.get("cpa_missing_reason")),
             "chatgpt_field_source": clean_str(record.get("chatgpt_field_source")),

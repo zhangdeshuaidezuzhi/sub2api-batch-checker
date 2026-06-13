@@ -46,11 +46,12 @@ def test_parse_verify_output() -> None:
     ]
 
 
-def test_build_verify_sql_quotes_names() -> None:
-    sql = importer.build_verify_sql(["normal@example.com", "o'hara@example.com"])
+def test_build_verify_sql_filters_by_import_tag() -> None:
+    sql = importer.build_verify_sql("tag with ' quote")
 
-    assert "'normal@example.com'" in sql
-    assert "'o''hara@example.com'" in sql
+    assert "extra ->> 'cloud_import_tag'" in sql
+    assert "'tag with '' quote'" in sql
+    assert "name IN" not in sql
     assert "credentials" not in sql.lower()
 
 
@@ -152,6 +153,27 @@ def test_generate_sql_dedupes_oauth_against_cloud_identity_fields() -> None:
     assert "a.credentials ->> 'chatgpt_user_id'" in sql
     assert "lower(a.credentials ->> 'email')" in sql
     assert "WHERE NOT EXISTS (SELECT 1 FROM existing_account)" in sql
+
+
+def test_generate_sql_does_not_use_email_or_name_when_access_token_exists() -> None:
+    sql = importer.sqlgen.build_insert_sql(
+        {
+            "name": "same-email@example.com",
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": {
+                "access_token": "new-access-token",
+                "email": "same-email@example.com",
+            },
+        },
+        "unit-test",
+        1,
+    )
+
+    assert "AND nullif(i.credentials ->> 'access_token', '') IS NOT NULL" in sql
+    assert "AND a.credentials ->> 'access_token' = i.credentials ->> 'access_token'" in sql
+    assert "AND nullif(i.credentials ->> 'access_token', '') IS NULL" in sql
+    assert "AND a.name = i.name" in sql
 
 
 def test_generate_sql_dedupes_apikey_by_key_and_base_url() -> None:

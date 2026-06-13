@@ -191,29 +191,47 @@ existing_account AS (
     AND a.platform = i.platform
     AND a.type = i.type
     AND (
-      a.name = i.name
-      OR (
-        nullif(i.credentials ->> 'access_token', '') IS NOT NULL
-        AND a.credentials ->> 'access_token' = i.credentials ->> 'access_token'
-      )
-      OR (
-        nullif(i.credentials ->> 'chatgpt_account_id', '') IS NOT NULL
-        AND a.credentials ->> 'chatgpt_account_id' = i.credentials ->> 'chatgpt_account_id'
-      )
-      OR (
-        nullif(i.credentials ->> 'chatgpt_user_id', '') IS NOT NULL
-        AND a.credentials ->> 'chatgpt_user_id' = i.credentials ->> 'chatgpt_user_id'
-      )
-      OR (
-        nullif(i.credentials ->> 'email', '') IS NOT NULL
-        AND lower(a.credentials ->> 'email') = lower(i.credentials ->> 'email')
-      )
-      OR (
-        nullif(i.credentials ->> 'api_key', '') IS NOT NULL
+      (
+        i.type = 'apikey'
+        AND nullif(i.credentials ->> 'api_key', '') IS NOT NULL
         AND nullif(i.credentials ->> 'base_url', '') IS NOT NULL
         AND a.credentials ->> 'api_key' = i.credentials ->> 'api_key'
         AND regexp_replace(lower(coalesce(a.credentials ->> 'base_url', '')), '/+$', '') =
             regexp_replace(lower(i.credentials ->> 'base_url'), '/+$', '')
+      )
+      OR (
+        i.type <> 'apikey'
+        AND nullif(i.credentials ->> 'access_token', '') IS NOT NULL
+        AND a.credentials ->> 'access_token' = i.credentials ->> 'access_token'
+      )
+      OR (
+        i.type <> 'apikey'
+        AND nullif(i.credentials ->> 'access_token', '') IS NULL
+        AND nullif(i.credentials ->> 'chatgpt_account_id', '') IS NOT NULL
+        AND a.credentials ->> 'chatgpt_account_id' = i.credentials ->> 'chatgpt_account_id'
+      )
+      OR (
+        i.type <> 'apikey'
+        AND nullif(i.credentials ->> 'access_token', '') IS NULL
+        AND nullif(i.credentials ->> 'chatgpt_account_id', '') IS NULL
+        AND nullif(i.credentials ->> 'chatgpt_user_id', '') IS NOT NULL
+        AND a.credentials ->> 'chatgpt_user_id' = i.credentials ->> 'chatgpt_user_id'
+      )
+      OR (
+        i.type <> 'apikey'
+        AND nullif(i.credentials ->> 'access_token', '') IS NULL
+        AND nullif(i.credentials ->> 'chatgpt_account_id', '') IS NULL
+        AND nullif(i.credentials ->> 'chatgpt_user_id', '') IS NULL
+        AND nullif(i.credentials ->> 'email', '') IS NOT NULL
+        AND lower(a.credentials ->> 'email') = lower(i.credentials ->> 'email')
+      )
+      OR (
+        i.type <> 'apikey'
+        AND nullif(i.credentials ->> 'access_token', '') IS NULL
+        AND nullif(i.credentials ->> 'chatgpt_account_id', '') IS NULL
+        AND nullif(i.credentials ->> 'chatgpt_user_id', '') IS NULL
+        AND nullif(i.credentials ->> 'email', '') IS NULL
+        AND a.name = i.name
       )
     )
   ORDER BY
@@ -346,13 +364,11 @@ def build_sql(bundle_path, accounts, import_tag):
     )
     for index, account in enumerate(accounts, start=1):
         lines.append(build_insert_sql(account, import_tag, index))
-    names = [sql_string(account_name(account, index)) for index, account in enumerate(accounts, start=1)]
-    names_sql = ", ".join(names) if names else "NULL"
     lines.append(
-        """SELECT 'summary|existing_or_inserted|' || count(*)
+        """SELECT 'summary|import_tag_rows|' || count(*)
 FROM accounts
 WHERE deleted_at IS NULL
-  AND name IN ({0});""".format(names_sql)
+  AND extra ->> 'cloud_import_tag' = {0};""".format(sql_string(import_tag))
     )
     lines.append("COMMIT;")
     lines.append("")
