@@ -94,6 +94,41 @@ def test_generate_sql_keeps_cloud_apikey_type() -> None:
     assert "model_mapping" in sql
 
 
+def test_generate_sql_links_default_group_and_group_proxy() -> None:
+    sql = importer.sqlgen.build_insert_sql(
+        {
+            "name": "user@example.com",
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": {"access_token": "dummy"},
+        },
+        "unit-test",
+        1,
+    )
+
+    assert "ops_group_default_proxies" in sql
+    assert "INSERT INTO account_groups" in sql
+    assert "'测试组'::varchar" in sql
+    assert "proxy_id" in sql
+
+
+def test_generate_sql_respects_explicit_group_name() -> None:
+    sql = importer.sqlgen.build_insert_sql(
+        {
+            "name": "free@example.com",
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": {"access_token": "dummy"},
+            "group_names": ["GPTFREE"],
+        },
+        "unit-test",
+        1,
+    )
+
+    assert "'GPTFREE'::varchar" in sql
+    assert "'测试组'::varchar" not in sql
+
+
 def test_dry_run_generates_sql_without_remote_calls(tmp_path, monkeypatch) -> None:
     bundle = tmp_path / "good.json"
     bundle.write_text(

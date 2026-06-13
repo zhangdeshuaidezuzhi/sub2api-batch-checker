@@ -3,6 +3,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+DEFAULT_GROUP_NAME = "测试组"
+
 
 def sql_string(value):
     return "'" + str(value).replace("'", "''") + "'"
@@ -83,6 +85,59 @@ def normalize_account_type(account):
     return account_type
 
 
+def _list_value(value):
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def account_group_ids(account):
+    values = []
+    values.extend(_list_value(account.get("group_ids")))
+    values.extend(_list_value(account.get("group_id")))
+    group_ids = []
+    for value in values:
+        try:
+            group_id = int(str(value).strip())
+        except Exception:
+            continue
+        if group_id > 0 and group_id not in group_ids:
+            group_ids.append(group_id)
+    return group_ids
+
+
+def account_group_names(account):
+    values = []
+    values.extend(_list_value(account.get("group_names")))
+    values.extend(_list_value(account.get("group_name")))
+    values.extend(_list_value(account.get("groups")))
+    values.extend(_list_value(account.get("group")))
+
+    group_names = []
+    for value in values:
+        if isinstance(value, dict):
+            text = str(value.get("name") or "").strip()
+        else:
+            text = str(value or "").strip()
+        if text and not text.isdigit() and text not in group_names:
+            group_names.append(text)
+
+    if not group_names and not account_group_ids(account):
+        group_names.append(DEFAULT_GROUP_NAME)
+    return group_names
+
+
+def group_values_sql(account):
+    rows = []
+    for group_id in account_group_ids(account):
+        rows.append("({0}::bigint, NULL::varchar)".format(group_id))
+    for group_name in account_group_names(account):
+        rows.append("(NULL::bigint, {0}::varchar)".format(sql_string(group_name)))
+    return ",\n    ".join(rows) if rows else "(NULL::bigint, {0}::varchar)".format(sql_string(DEFAULT_GROUP_NAME))
+
+
 def load_accounts(bundle_path):
     payload = json.loads(bundle_path.read_text(encoding="utf-8"))
     accounts = payload.get("accounts")
@@ -117,13 +172,46 @@ def build_insert_sql(account, import_tag, index):
         "rate_multiplier": str(account.get("rate_multiplier") or 1),
     }
 
-    return """WITH inserted AS (
+    return """WITH desired_groups(group_id, group_name) AS (
+  VALUES
+    {group_values}
+),
+resolved_groups AS (
+  SELECT DISTINCT g.id
+  FROM groups g
+  JOIN desired_groups dg ON (
+    (dg.group_id IS NOT NULL AND g.id = dg.group_id)
+    OR (dg.group_id IS NULL AND g.name = dg.group_name)
+  )
+  WHERE g.deleted_at IS NULL
+    AND g.status = 'active'
+),
+selected_proxy AS (
+  SELECT proxy_id
+  FROM (
+    SELECT gp.proxy_id, 0 AS rank
+    FROM ops_group_default_proxies gp
+    JOIN resolved_groups rg ON rg.id = gp.group_id
+    JOIN proxies p ON p.id = gp.proxy_id
+    WHERE p.deleted_at IS NULL
+      AND p.status = 'active'
+    UNION ALL
+    SELECT p.id AS proxy_id, 1 AS rank
+    FROM proxies p
+    WHERE p.deleted_at IS NULL
+      AND p.status = 'active'
+  ) candidates
+  ORDER BY rank, proxy_id
+  LIMIT 1
+),
+inserted AS (
   INSERT INTO accounts (
     name,
     platform,
     type,
     credentials,
     extra,
+    proxy_id,
     concurrency,
     priority,
     status,
@@ -138,6 +226,7 @@ def build_insert_sql(account, import_tag, index):
     {type},
     {credentials}::jsonb,
     {extra}::jsonb,
+    (SELECT proxy_id FROM selected_proxy),
     {concurrency},
     {priority},
     {status},
@@ -152,8 +241,42 @@ def build_insert_sql(account, import_tag, index):
       AND name = {name}
   )
   RETURNING id, name
+),
+target_account AS (
+  SELECT id, name FROM inserted
+  UNION ALL
+  SELECT id, name
+  FROM accounts
+  WHERE deleted_at IS NULL
+    AND name = {name}
+    AND NOT EXISTS (SELECT 1 FROM inserted)
+  LIMIT 1
+),
+proxy_update AS (
+  UPDATE accounts a
+  SET proxy_id = (SELECT proxy_id FROM selected_proxy),
+      updated_at = now()
+  FROM target_account ta
+  WHERE a.id = ta.id
+    AND a.proxy_id IS NULL
+    AND EXISTS (SELECT 1 FROM selected_proxy)
+  RETURNING 1
+),
+group_links AS (
+  INSERT INTO account_groups (account_id, group_id, priority, created_at)
+  SELECT ta.id, rg.id, 100, now()
+  FROM target_account ta
+  CROSS JOIN resolved_groups rg
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM account_groups ag
+    WHERE ag.account_id = ta.id
+      AND ag.group_id = rg.id
+  )
+  RETURNING 1
 )
 SELECT coalesce((SELECT 'inserted|' || id::text || '|' || name FROM inserted), 'skipped|' || {name});""".format(
+        group_values=group_values_sql(account),
         name=sql_string(values["name"]),
         platform=sql_string(values["platform"]),
         type=sql_string(values["type"]),
@@ -174,6 +297,15 @@ def build_sql(bundle_path, accounts, import_tag):
     lines.append("-- generated_from={0}".format(bundle_path))
     lines.append("-- import_tag={0}".format(import_tag))
     lines.append("BEGIN;")
+    lines.append(
+        """CREATE TABLE IF NOT EXISTS ops_group_default_proxies (
+  group_id bigint PRIMARY KEY,
+  proxy_id bigint NOT NULL,
+  notes text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);"""
+    )
     for index, account in enumerate(accounts, start=1):
         lines.append(build_insert_sql(account, import_tag, index))
     names = [sql_string(account_name(account, index)) for index, account in enumerate(accounts, start=1)]

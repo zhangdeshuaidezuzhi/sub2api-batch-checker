@@ -103,6 +103,24 @@ Windows 也可以把 good 包拖到：
 
 默认不保留本地或远端临时 SQL；需要排查时再显式加 `--keep-local-sql` 或 `--keep-remote-sql`。
 
+## 注册机 results 兜底补录
+
+本机注册机控制台 `http://127.0.0.1:18766/` 正常会自动转换并导入云端 Sub2API。遇到网络波动导致漏导入时，用本工具从本机原始 `results` 重新转换、去重，并通过同一条云端 SSH SQL 路线补录。
+
+先预演，确认转换数量和 SQL 计划：
+
+```text
+注册机results兜底导入云端-预演.cmd
+```
+
+确认后正式导入：
+
+```text
+注册机results兜底导入云端.cmd
+```
+
+两个入口都可以拖入或传入 `D:\注册机最新版\results` 下的某个 `批次_*` 目录；不传参数时默认扫描整个 `results`。工具只导入 `access_token + id_token` 完整记录，缺字段记录会写入 skipped 文件，不进入云端。
+
 ## 上游 API key 检测并导入
 
 用户给 `base_url + API key` 时，走单独流程：先测 `/v1/models`，再选一个模型测 `/v1/chat/completions`。两步都通过才生成 good 包并导入云端；任一步失败直接废弃，不导入。
