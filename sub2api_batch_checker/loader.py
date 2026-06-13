@@ -17,18 +17,26 @@ def _stable_json(value: Any) -> str:
 
 def _fingerprint(account: dict[str, Any]) -> str:
     credentials = account.get("credentials") or {}
-    basis = "|".join(
-        [
-            str(account.get("platform") or ""),
-            str(account.get("type") or ""),
-            str(credentials.get("chatgpt_account_id") or ""),
-            str(credentials.get("refresh_token") or ""),
-            str(credentials.get("access_token") or ""),
-            str(credentials.get("api_key") or ""),
-            str(credentials.get("base_url") or ""),
-            str(account.get("name") or ""),
-        ]
-    )
+    platform = str(account.get("platform") or "")
+    account_type = str(account.get("type") or "")
+    api_key = str(credentials.get("api_key") or "")
+    base_url = str(credentials.get("base_url") or "").strip().lower().rstrip("/")
+
+    if account_type.lower() in {"apikey", "api_key"} and api_key and base_url:
+        basis = "|".join([platform, "apikey", base_url, api_key])
+    else:
+        identity = ("empty", "")
+        for label, value in (
+            ("chatgpt_account_id", str(credentials.get("chatgpt_account_id") or "")),
+            ("chatgpt_user_id", str(credentials.get("chatgpt_user_id") or "")),
+            ("refresh_token", str(credentials.get("refresh_token") or "")),
+            ("access_token", str(credentials.get("access_token") or "")),
+            ("name", str(account.get("name") or "")),
+        ):
+            if value:
+                identity = (label, value)
+                break
+        basis = "|".join([platform, account_type, identity[0], identity[1]])
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 

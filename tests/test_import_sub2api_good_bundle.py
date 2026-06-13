@@ -189,7 +189,7 @@ def test_generate_sql_dedupes_oauth_against_cloud_identity_fields() -> None:
     assert "WHERE NOT EXISTS (SELECT 1 FROM existing_account)" in sql
 
 
-def test_generate_sql_does_not_use_email_or_name_when_access_token_exists() -> None:
+def test_generate_sql_uses_stable_oauth_identity_even_when_access_token_exists() -> None:
     sql = importer.sqlgen.build_insert_sql(
         {
             "name": "same-email@example.com",
@@ -197,6 +197,8 @@ def test_generate_sql_does_not_use_email_or_name_when_access_token_exists() -> N
             "type": "oauth",
             "credentials": {
                 "access_token": "new-access-token",
+                "chatgpt_account_id": "acc_same",
+                "chatgpt_user_id": "user_same",
                 "email": "same-email@example.com",
             },
         },
@@ -204,9 +206,12 @@ def test_generate_sql_does_not_use_email_or_name_when_access_token_exists() -> N
         1,
     )
 
-    assert "AND nullif(i.credentials ->> 'access_token', '') IS NOT NULL" in sql
+    account_id_pos = sql.index("a.credentials ->> 'chatgpt_account_id'")
+    user_id_pos = sql.index("a.credentials ->> 'chatgpt_user_id'")
+    access_pos = sql.index("a.credentials ->> 'access_token'")
+    assert account_id_pos < user_id_pos < access_pos
+    assert "AND nullif(i.credentials ->> 'refresh_token', '') IS NULL" in sql
     assert "AND a.credentials ->> 'access_token' = i.credentials ->> 'access_token'" in sql
-    assert "AND nullif(i.credentials ->> 'access_token', '') IS NULL" in sql
     assert "AND a.name = i.name" in sql
 
 

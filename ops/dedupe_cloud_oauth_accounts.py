@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Audit and soft-delete duplicate cloud OAuth accounts.
 
-The cleanup key is the OAuth access token.  The report never prints token
-values; samples use MD5 prefixes only to make duplicate groups recognizable.
-Default mode is dry-run.  --apply soft-deletes duplicate rows and keeps the
-best row per token.
+The cleanup key prefers durable upstream identity fields before temporary
+tokens. The report never prints raw identity values; samples use MD5 prefixes
+only to make duplicate groups recognizable. Default mode is dry-run.  --apply
+soft-deletes duplicate rows and keeps the best row per identity.
 """
 
 from __future__ import annotations
@@ -73,6 +73,7 @@ WITH base AS (
     a.created_at,
     a.updated_at,
     nullif(a.credentials ->> 'access_token', '') AS access_token,
+    nullif(a.credentials ->> 'refresh_token', '') AS refresh_token,
     nullif(a.credentials ->> 'chatgpt_account_id', '') AS chatgpt_account_id,
     nullif(a.credentials ->> 'chatgpt_user_id', '') AS chatgpt_user_id,
     nullif(lower(a.credentials ->> 'email'), '') AS email,
@@ -85,29 +86,48 @@ WITH base AS (
     AND a.type = 'oauth'
   GROUP BY a.id
 ),
+keyed AS (
+  SELECT
+    b.*,
+    CASE
+      WHEN chatgpt_account_id IS NOT NULL THEN 'chatgpt_account_id'
+      WHEN chatgpt_user_id IS NOT NULL THEN 'chatgpt_user_id'
+      WHEN refresh_token IS NOT NULL THEN 'refresh_token'
+      WHEN access_token IS NOT NULL THEN 'access_token'
+      ELSE NULL
+    END AS dedupe_key_type,
+    CASE
+      WHEN chatgpt_account_id IS NOT NULL THEN chatgpt_account_id
+      WHEN chatgpt_user_id IS NOT NULL THEN chatgpt_user_id
+      WHEN refresh_token IS NOT NULL THEN refresh_token
+      WHEN access_token IS NOT NULL THEN access_token
+      ELSE NULL
+    END AS dedupe_key
+  FROM base b
+),
 dup_keys AS (
-  SELECT access_token
-  FROM base
-  WHERE access_token IS NOT NULL
-  GROUP BY access_token
+  SELECT dedupe_key_type, dedupe_key
+  FROM keyed
+  WHERE dedupe_key IS NOT NULL
+  GROUP BY dedupe_key_type, dedupe_key
   HAVING count(*) > 1
 ),
 ranked AS (
   SELECT
-    b.*,
-    md5(b.access_token) AS token_hash,
-    count(*) OVER (PARTITION BY b.access_token) AS duplicate_count,
+    k.*,
+    md5(k.dedupe_key) AS key_hash,
+    count(*) OVER (PARTITION BY k.dedupe_key_type, k.dedupe_key) AS duplicate_count,
     row_number() OVER (
-      PARTITION BY b.access_token
+      PARTITION BY k.dedupe_key_type, k.dedupe_key
       ORDER BY
-        CASE WHEN b.status = 'active' AND b.schedulable = true THEN 0 ELSE 1 END,
-        CASE WHEN b.status = 'active' THEN 0 ELSE 1 END,
-        CASE WHEN b.groups LIKE '%GPTFREE%' THEN 0 ELSE 1 END,
-        CASE WHEN b.groups LIKE '%限流账号%' THEN 1 ELSE 0 END,
-        b.id DESC
+        CASE WHEN k.status = 'active' AND k.schedulable = true THEN 0 ELSE 1 END,
+        CASE WHEN k.status = 'active' THEN 0 ELSE 1 END,
+        CASE WHEN k.groups LIKE '%GPTFREE%' THEN 0 ELSE 1 END,
+        CASE WHEN k.groups LIKE '%限流账号%' THEN 1 ELSE 0 END,
+        k.id DESC
     ) AS keep_rank
-  FROM base b
-  JOIN dup_keys d ON d.access_token = b.access_token
+  FROM keyed k
+  JOIN dup_keys d ON d.dedupe_key_type = k.dedupe_key_type AND d.dedupe_key = k.dedupe_key
 )
 """
 
@@ -116,7 +136,7 @@ def audit_sql(sample_limit: int) -> str:
     return (
         ranked_cte()
         + """
-SELECT 'summary|duplicate_groups|' || count(DISTINCT token_hash) || '|duplicate_rows|' || count(*) || '|soft_delete_candidates|' || count(*) FILTER (WHERE keep_rank > 1)
+SELECT 'summary|duplicate_groups|' || count(DISTINCT dedupe_key_type || ':' || key_hash) || '|duplicate_rows|' || count(*) || '|soft_delete_candidates|' || count(*) FILTER (WHERE keep_rank > 1)
 FROM ranked
 UNION ALL
 SELECT 'summary|keep_schedulable|' || count(*) FROM ranked WHERE keep_rank = 1 AND status = 'active' AND schedulable = true
@@ -131,10 +151,10 @@ SELECT 'summary|delete_nonactive|' || count(*) FROM ranked WHERE keep_rank > 1 A
 """
         + ranked_cte()
         + """
-SELECT 'sample|' || left(token_hash, 10) || '|' ||
+SELECT 'sample|' || dedupe_key_type || ':' || left(key_hash, 10) || '|' ||
        string_agg(id::text || ':' || status || ':' || schedulable::text || ':' || groups || ':keep=' || keep_rank::text, ';' ORDER BY keep_rank, id)
 FROM ranked
-GROUP BY token_hash
+GROUP BY dedupe_key_type, key_hash
 ORDER BY count(*) DESC, min(id)
 LIMIT {0};
 """.format(

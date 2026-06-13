@@ -109,3 +109,43 @@ def test_convert_register_results_ignores_generated_sub2api_outputs(tmp_path):
 
     assert summary["raw_records"] == 0
     assert summary["accounts"] == 0
+
+
+def test_convert_register_results_dedupes_by_account_id_before_access_token(tmp_path):
+    results_dir = tmp_path / "results"
+    results_dir.mkdir(parents=True)
+    id_token = _jwt({"email": "user@example.com"})
+    older_access = _jwt(
+        {
+            "exp": 2000000000,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acc_same",
+                "chatgpt_user_id": "user_same",
+            },
+            "https://api.openai.com/profile": {"email": "old@example.com"},
+        }
+    )
+    newer_access = _jwt(
+        {
+            "exp": 2000000000,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acc_same",
+                "chatgpt_user_id": "user_same",
+            },
+            "https://api.openai.com/profile": {"email": "new@example.com"},
+        }
+    )
+    old_file = results_dir / "old.json"
+    new_file = results_dir / "new.json"
+    old_file.write_text(json.dumps({"access_token": older_access, "id_token": id_token}), encoding="utf-8")
+    new_file.write_text(
+        json.dumps({"access_token": newer_access, "id_token": id_token, "refresh_token": "refresh"}),
+        encoding="utf-8",
+    )
+
+    summary = converter.convert_results(results_dir, tmp_path / "out")
+
+    assert summary["raw_records"] == 2
+    assert summary["deduped_records"] == 1
+    payload = json.loads(Path(summary["output_path"]).read_text(encoding="utf-8"))
+    assert payload["accounts"][0]["credentials"]["access_token"] == newer_access

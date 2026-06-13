@@ -104,9 +104,18 @@ def email_key(email: str) -> str:
 
 
 def record_source_key(record: dict[str, Any]) -> str:
-    access_token = clean_str(record.get("access_token"))
-    if access_token:
-        return "access_sha256:" + hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    access_payload = decode_jwt_payload(clean_str(record.get("access_token")))
+    id_payload = decode_jwt_payload(clean_str(record.get("id_token")))
+    claims = extract_claim_fields(access_payload, id_payload)
+    for label, value in (
+        ("chatgpt_account_id", first_non_empty(record.get("chatgpt_account_id"), record.get("account_id"), claims.get("chatgpt_account_id"))),
+        ("chatgpt_user_id", first_non_empty(record.get("chatgpt_user_id"), record.get("chatgpt_auth_user_id"), claims.get("chatgpt_user_id"))),
+        ("refresh_sha256", clean_str(record.get("refresh_token"))),
+        ("access_sha256", clean_str(record.get("access_token"))),
+    ):
+        if value:
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest() if label.endswith("_sha256") else value
+            return "{0}:{1}".format(label, digest)
     for key in ("bind_email", "email", "phone"):
         value = clean_str(record.get(key)).lower()
         if value:

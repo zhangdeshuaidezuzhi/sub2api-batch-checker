@@ -226,6 +226,78 @@ def test_load_openai_api_key_with_base_url(tmp_path: Path) -> None:
     assert account.raw["extra"]["source_format"] == "openai_api_key_json"
 
 
+def test_load_dedupe_prefers_stable_oauth_identity_over_access_token(tmp_path: Path) -> None:
+    token_file = tmp_path / "same-account-different-access.json"
+    token_file.write_text(
+        """
+        {
+          "accounts": [
+            {
+              "name": "first@example.com",
+              "platform": "openai",
+              "type": "oauth",
+              "credentials": {
+                "chatgpt_account_id": "acc_same",
+                "access_token": "access-token-1"
+              }
+            },
+            {
+              "name": "second@example.com",
+              "platform": "openai",
+              "type": "oauth",
+              "credentials": {
+                "chatgpt_account_id": "acc_same",
+                "access_token": "access-token-2"
+              }
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    accounts, errors = load_sub2api_accounts([token_file], dedupe=True)
+
+    assert errors == []
+    assert len(accounts) == 1
+
+
+def test_load_dedupe_normalizes_api_key_base_url(tmp_path: Path) -> None:
+    token_file = tmp_path / "same-api-key-different-base-url.json"
+    token_file.write_text(
+        """
+        {
+          "accounts": [
+            {
+              "name": "hub-1",
+              "platform": "openai",
+              "type": "apikey",
+              "credentials": {
+                "base_url": "https://hub.example.com/",
+                "api_key": "sk-test"
+              }
+            },
+            {
+              "name": "hub-2",
+              "platform": "openai",
+              "type": "apikey",
+              "credentials": {
+                "base_url": "https://HUB.example.com",
+                "api_key": "sk-test"
+              }
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    accounts, errors = load_sub2api_accounts([token_file], dedupe=True)
+
+    assert errors == []
+    assert len(accounts) == 1
+
+
 def test_load_cpa_json_from_zip(tmp_path: Path) -> None:
     zip_file = tmp_path / "delivery.zip"
     token_json = """

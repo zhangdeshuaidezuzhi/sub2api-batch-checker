@@ -13,10 +13,12 @@ spec.loader.exec_module(dedupe)
 def test_audit_sql_does_not_select_raw_tokens():
     sql = dedupe.audit_sql(5)
 
-    assert "md5(b.access_token)" in sql
-    assert "left(token_hash, 10)" in sql
-    assert "SELECT access_token" in sql
+    assert "md5(k.dedupe_key)" in sql
+    assert "left(key_hash, 10)" in sql
+    assert "chatgpt_account_id IS NOT NULL THEN 'chatgpt_account_id'" in sql
+    assert "access_token IS NOT NULL THEN 'access_token'" in sql
     assert "'sample|' || access_token" not in sql
+    assert "'sample|' || dedupe_key ||" not in sql
 
 
 def test_apply_sql_soft_deletes_duplicates_only():

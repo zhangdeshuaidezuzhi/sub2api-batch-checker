@@ -201,27 +201,36 @@ existing_account AS (
       )
       OR (
         i.type <> 'apikey'
-        AND nullif(i.credentials ->> 'access_token', '') IS NOT NULL
-        AND a.credentials ->> 'access_token' = i.credentials ->> 'access_token'
-      )
-      OR (
-        i.type <> 'apikey'
-        AND nullif(i.credentials ->> 'access_token', '') IS NULL
         AND nullif(i.credentials ->> 'chatgpt_account_id', '') IS NOT NULL
         AND a.credentials ->> 'chatgpt_account_id' = i.credentials ->> 'chatgpt_account_id'
       )
       OR (
         i.type <> 'apikey'
-        AND nullif(i.credentials ->> 'access_token', '') IS NULL
         AND nullif(i.credentials ->> 'chatgpt_account_id', '') IS NULL
         AND nullif(i.credentials ->> 'chatgpt_user_id', '') IS NOT NULL
         AND a.credentials ->> 'chatgpt_user_id' = i.credentials ->> 'chatgpt_user_id'
       )
       OR (
         i.type <> 'apikey'
+        AND nullif(i.credentials ->> 'chatgpt_account_id', '') IS NULL
+        AND nullif(i.credentials ->> 'chatgpt_user_id', '') IS NULL
+        AND nullif(i.credentials ->> 'refresh_token', '') IS NOT NULL
+        AND a.credentials ->> 'refresh_token' = i.credentials ->> 'refresh_token'
+      )
+      OR (
+        i.type <> 'apikey'
+        AND nullif(i.credentials ->> 'chatgpt_account_id', '') IS NULL
+        AND nullif(i.credentials ->> 'chatgpt_user_id', '') IS NULL
+        AND nullif(i.credentials ->> 'refresh_token', '') IS NULL
+        AND nullif(i.credentials ->> 'access_token', '') IS NOT NULL
+        AND a.credentials ->> 'access_token' = i.credentials ->> 'access_token'
+      )
+      OR (
+        i.type <> 'apikey'
         AND nullif(i.credentials ->> 'access_token', '') IS NULL
         AND nullif(i.credentials ->> 'chatgpt_account_id', '') IS NULL
         AND nullif(i.credentials ->> 'chatgpt_user_id', '') IS NULL
+        AND nullif(i.credentials ->> 'refresh_token', '') IS NULL
         AND nullif(i.credentials ->> 'email', '') IS NOT NULL
         AND lower(a.credentials ->> 'email') = lower(i.credentials ->> 'email')
       )
@@ -230,6 +239,7 @@ existing_account AS (
         AND nullif(i.credentials ->> 'access_token', '') IS NULL
         AND nullif(i.credentials ->> 'chatgpt_account_id', '') IS NULL
         AND nullif(i.credentials ->> 'chatgpt_user_id', '') IS NULL
+        AND nullif(i.credentials ->> 'refresh_token', '') IS NULL
         AND nullif(i.credentials ->> 'email', '') IS NULL
         AND a.name = i.name
       )
