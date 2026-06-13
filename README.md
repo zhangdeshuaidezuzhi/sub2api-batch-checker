@@ -152,6 +152,20 @@ $env:SUB2API_CLOUD_SSH_TARGET = "user@host"
 
 `ops/sub2api_cloud_maintenance.py` 只维护 OAuth/token JSON 账号，不处理 `type=apikey` 上游账号。维护入口会分批探测历史遗留的 `active + schedulable=false` 且没有 reset/reason/probe 标记的 OAuth 账号，也会处理已有 `cloud-maintenance:` 标记但缺少 reset 到期时间的卡死暂停账号：探针 ok 就恢复调度，明确认证失效、封禁或额度耗尽就移入 `限流账号` 人工审核分组，临时限流或网络失败累计到阈值后也移入人工审核分组，不再自动软删除账号记录。
 
+历史重复 OAuth 账号用单独工具处理，默认只审计，不直接改库：
+
+```powershell
+python .\ops\dedupe_cloud_oauth_accounts.py
+```
+
+确认后再软删除多余重复行：
+
+```powershell
+python .\ops\dedupe_cloud_oauth_accounts.py --apply
+```
+
+该工具按 OAuth `access_token` 聚合重复，保留优先级是 `active+schedulable`、`active`、带 `GPTFREE`、非 `限流账号`、较新 ID；只 soft-delete 多余账号，不处理 `type=apikey`。
+
 ## 状态分类
 
 - `ok`：可用
