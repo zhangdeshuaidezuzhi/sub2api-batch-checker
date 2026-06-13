@@ -129,6 +129,24 @@ def test_generate_sql_does_not_add_default_group_to_review_group_accounts() -> N
     assert "review_ag.account_id = ta.id" in sql
 
 
+def test_generate_sql_removes_default_test_group_when_linking_business_group() -> None:
+    sql = importer.sqlgen.build_insert_sql(
+        {
+            "name": "business@example.com",
+            "platform": "openai",
+            "type": "oauth",
+            "credentials": {"access_token": "dummy"},
+            "group_names": ["GPTFREE"],
+        },
+        "unit-test",
+        1,
+    )
+
+    assert "default_group_cleanup AS" in sql
+    assert "default_g.name = '测试组'" in sql
+    assert "desired_g.name <> '测试组'" in sql
+
+
 def test_generate_sql_respects_explicit_group_name() -> None:
     sql = importer.sqlgen.build_insert_sql(
         {

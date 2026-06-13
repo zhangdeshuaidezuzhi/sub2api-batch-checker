@@ -338,6 +338,21 @@ group_links AS (
       AND ag.group_id = rg.id
   )
   RETURNING 1
+),
+default_group_cleanup AS (
+  DELETE FROM account_groups ag
+  USING target_account ta, groups default_g
+  WHERE ag.account_id = ta.id
+    AND ag.group_id = default_g.id
+    AND default_g.name = '测试组'
+    AND default_g.deleted_at IS NULL
+    AND EXISTS (
+      SELECT 1
+      FROM resolved_groups rg
+      JOIN groups desired_g ON desired_g.id = rg.id
+      WHERE desired_g.name <> '测试组'
+    )
+  RETURNING 1
 )
 SELECT coalesce((SELECT 'inserted|' || id::text || '|' || name FROM inserted), 'skipped|' || {name});""".format(
         group_values=group_values_sql(account),
