@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_GROUP_NAME = "测试组"
+DEFAULT_GROUP_NAME = "GPTFREE"
 
 
 def sql_string(value):

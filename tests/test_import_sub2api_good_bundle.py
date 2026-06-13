@@ -108,7 +108,7 @@ def test_generate_sql_links_default_group_and_group_proxy() -> None:
 
     assert "ops_group_default_proxies" in sql
     assert "INSERT INTO account_groups" in sql
-    assert "'测试组'::varchar" in sql
+    assert "'GPTFREE'::varchar" in sql
     assert "proxy_id" in sql
 
 
@@ -119,14 +119,14 @@ def test_generate_sql_respects_explicit_group_name() -> None:
             "platform": "openai",
             "type": "oauth",
             "credentials": {"access_token": "dummy"},
-            "group_names": ["GPTFREE"],
+            "group_names": ["GPTPLUS"],
         },
         "unit-test",
         1,
     )
 
-    assert "'GPTFREE'::varchar" in sql
-    assert "'测试组'::varchar" not in sql
+    assert "'GPTPLUS'::varchar" in sql
+    assert "'GPTFREE'::varchar" not in sql
 
 
 def test_generate_sql_dedupes_oauth_against_cloud_identity_fields() -> None:
